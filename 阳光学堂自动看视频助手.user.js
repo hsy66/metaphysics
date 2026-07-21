@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阳光学堂自动看视频助手
 // @namespace    http://tampermonkey.net/
-// @version      10.3.3
+// @version      10.3.4
 // @description  播放页严格v5.4；课内全「已完成」才算完课；自动考试(修冷却卡死/手动考试清锁/正式开考)；默认禁止自动回跳路径。仅测试自用。
 // @author       You
 // @match        https://xue.sinosig.com/*
