@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阳光学堂自动看视频助手
 // @namespace    http://tampermonkey.net/
-// @version      10.3.10
+// @version      10.3.11
 // @description  播放页严格v5.4；课内全「已完成」才算完课；自动考试(修冷却卡死/手动考试清锁/正式开考)；默认禁止自动回跳路径。仅测试自用。
 // @author       You
 // @match        https://xue.sinosig.com/*
@@ -19,7 +19,7 @@
   }
   window.__xueAutoWatchV10Loaded = true;
 
-  const VER = '10.3.10';
+  const VER = '10.3.11';
   const TAG = '[学堂助手]';
   const STORE_KEY = 'xue_auto_watch_v10';
   const LOG_KEY = 'xue_auto_watch_v10_logs';
@@ -365,16 +365,37 @@
     return parts[parts.length - 1] || '';
   }
 
+  // 跨标签页心跳观察：视频加速工具会改 Date，各标签页时钟不同步，时间戳直接比大小不可靠，
+  // 所以判断播放页死活以「心跳值是否还在变」为准（用本页时钟计时）
+  let hbSeenValue = -1;
+  let hbSeenAt = 0;
+  let hbChangedEver = false;
+
   function hasLivePlayerLock(st) {
     if (!CFG.oneCourseAtATime || !st) return false;
     if (st.phase !== 'playing') return false;
     const now = Date.now();
     const hb = st.playerHeartbeatAt || 0;
     const opened = st.activeOpenedAt || 0;
-    // 播放页已明确关闭且宽限期内无新心跳 → 锁立即失效，不用等心跳超时
     const gone = st.playerUnloadAt || 0;
-    if (gone && gone >= hb && now - gone > (CFG.playerGoneGraceMs || 8000)) return false;
-    if (hb && now - hb < CFG.playerHeartbeatTimeoutSec * 1000) return true;
+
+    if (hb !== hbSeenValue) {
+      if (hbSeenValue !== -1) hbChangedEver = true;
+      hbSeenValue = hb;
+      hbSeenAt = now;
+    }
+
+    // 播放页已明确关闭且宽限期内心跳没再变 → 锁立即失效，不用等心跳超时
+    if (gone && gone >= hb && now - hbSeenAt > (CFG.playerGoneGraceMs || 8000)) return false;
+
+    // 心跳值持续不变超过超时时间 → 播放页已死
+    if (now - hbSeenAt > CFG.playerHeartbeatTimeoutSec * 1000) return false;
+
+    // 本页亲眼观察到心跳在跳 → 一定活着，无视时间戳大小
+    if (hbChangedEver) return true;
+
+    // 本页刚打开、还观察不出变化：按时间戳粗判；心跳来自「未来」=对方时钟被加速，先按活处理
+    if (hb && (hb > now || now - hb < CFG.playerHeartbeatTimeoutSec * 1000)) return true;
     if (opened && now - opened < Math.max(CFG.playerHeartbeatTimeoutSec, 30) * 1000) return true;
     return false;
   }
@@ -678,6 +699,11 @@
       }
       if (cid) {
         const now = Date.now();
+        // 刚完成的课，网站残留逻辑又要重开它：拦截，否则会把 course_done 覆盖回 playing，卡住不开下一门
+        if (st.phase === 'course_done' && cid === st.lastFinishedCourseId) {
+          LogW('拦截重开刚完成的课程', { cid: cid });
+          return null;
+        }
         // 同一门课短时间内的重复开课（网站一次点击会连发两次 window.open）：拦截重复，避免开两个播放标签
         if (recentCourseOpens[cid] && now - recentCourseOpens[cid] < (CFG.courseOpenDedupMs || 6000)) {
           LogW('拦截重复开课窗口', { cid: cid, ago: now - recentCourseOpens[cid] });
@@ -1420,6 +1446,8 @@
 
   function playerAdvanceTick() {
     if (!document.body) return;
+    // 完课后等待跳回路径页期间，心跳绝不能再把 course_done 覆盖回 playing
+    if (finishTriggered) return;
     const video = getVideo();
     const stats = sectionStats();
     const cid = courseIdFromUrl(location.href);
