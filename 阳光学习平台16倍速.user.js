@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         阳光学习平台16倍速
 // @namespace    https://xue.sinosig.com/
-// @version      8.0
-// @description  默认16倍速（浏览器最高限制），解决CSP阻止问题
+// @version      8.1
+// @description  默认16倍速（浏览器最高限制），解决CSP阻止问题。建议使用2倍或4倍，过高倍速可能被平台检测
 // @author       You
 // @match        https://xue.sinosig.com/*
 // @match        https://*.sinosig.com/*

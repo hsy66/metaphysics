@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阳光学堂自动看视频助手
 // @namespace    http://tampermonkey.net/
-// @version      10.3.4
+// @version      10.3.10
 // @description  播放页严格v5.4；课内全「已完成」才算完课；自动考试(修冷却卡死/手动考试清锁/正式开考)；默认禁止自动回跳路径。仅测试自用。
 // @author       You
 // @match        https://xue.sinosig.com/*
@@ -19,7 +19,7 @@
   }
   window.__xueAutoWatchV10Loaded = true;
 
-  const VER = '10.3.4';
+  const VER = '10.3.10';
   const TAG = '[学堂助手]';
   const STORE_KEY = 'xue_auto_watch_v10';
   const LOG_KEY = 'xue_auto_watch_v10_logs';
@@ -37,9 +37,9 @@
   const CFG = {
     // 用户负责打开「我的学习→专属成长计划→具体任务」；脚本默认不自动点计划卡片
     autoOpenPlan: false,
-    // 路径页：默认不自动点「开始/继续学习」（防连环开课/弹窗重定向）
-    // 需要自动开课：面板点「开下一门」，或把此项改为 true
-    autoOpenFromPath: false,
+    // 路径页：默认自动点「开始/继续学习」自动刷课
+    // 如需改回手动（防连环开课/弹窗重定向），把此项改为 false，或用面板「开下一门」
+    autoOpenFromPath: true,
     openNextOnlyAfterCourseDone: true,
     // 同时只开一门视频课
     oneCourseAtATime: true,
@@ -48,6 +48,11 @@
     doneWaitMs: 8000,
     pathOpenCooldownMs: 15000,
     playerHeartbeatTimeoutSec: 90,
+    // 播放页关闭(pagehide)后，超过此宽限期仍无新心跳 → 立即释放播放锁（不用等满90s）
+    // 宽限期内刷新/重载会恢复心跳覆盖此信号，不会误杀
+    playerGoneGraceMs: 8000,
+    // 同一门课短时间内重复 window.open 去重（网站一次点击会开两次）
+    courseOpenDedupMs: 6000,
     // 绝对不要关标签（闪退主因之一）
     closePlayerWhenDone: false,
     // 禁止 history.back / 乱 reload
@@ -61,10 +66,10 @@
     // 详细日志
     verboseLog: true,
     maxLogEntries: 400,
-    // 自动考试：盲答交卷 → 看答案记忆 → 再考一次用记忆答案
-    autoExam: true,
-    // 路径页：视频都学完后，是否自动点「待考试/开始考试/重新考试」
-    autoOpenExamFromPath: true,
+    // 自动考试：盲答交卷 → 看答案记忆 → 再考一次用记忆答案（已关闭，仅自动看课不自动考试）
+    autoExam: false,
+    // 路径页：视频都学完后，是否自动点「待考试/开始考试/重新考试」（已关闭）
+    autoOpenExamFromPath: false,
     // 考试页轮询
     examScanMs: 4000,
     // 开考/开记录冷却（防连环开窗）
@@ -350,7 +355,8 @@
   }
 
   function courseIdFromUrl(url) {
-    const m = String(url || location.href).match(/courseDetail\/(\d+)/);
+    // 课程ID可能是纯数字(2074399...)或十六进制(8a4896977f88...)，不能只匹配 \d+
+    const m = String(url || location.href).match(/courseDetail\/([0-9a-zA-Z_-]+)/);
     return m ? m[1] : '';
   }
   function parseCourseIdFromBtnId(id) {
@@ -365,6 +371,9 @@
     const now = Date.now();
     const hb = st.playerHeartbeatAt || 0;
     const opened = st.activeOpenedAt || 0;
+    // 播放页已明确关闭且宽限期内无新心跳 → 锁立即失效，不用等心跳超时
+    const gone = st.playerUnloadAt || 0;
+    if (gone && gone >= hb && now - gone > (CFG.playerGoneGraceMs || 8000)) return false;
     if (hb && now - hb < CFG.playerHeartbeatTimeoutSec * 1000) return true;
     if (opened && now - opened < Math.max(CFG.playerHeartbeatTimeoutSec, 30) * 1000) return true;
     return false;
@@ -580,17 +589,24 @@
 
     // ========== 核心5：HLS网络错误自动刷新 ==========
     (function hlsErrorAutoReload() {
-      const ERROR_KEYWORD = '网络错误导致视频下载中途失败';
+      // 命中任一关键词即视为播放失败，自动 F5
+      const ERROR_KEYWORDS = [
+        '网络错误导致视频下载中途失败',
+        '请求超时',
+        '请稍后再试',
+      ];
       let reloadTriggered = false;
 
       function checkAndReload() {
         if (reloadTriggered) return;
-        const errorDialogs = document.querySelectorAll('.vjs-errors-dialog, .vjs-modal-dialog-content');
+        const errorDialogs = document.querySelectorAll(
+          '.vjs-errors-dialog, .vjs-modal-dialog-content, .vjs-errors-message'
+        );
         for (const dialog of errorDialogs) {
-          const t = dialog.innerText || '';
-          if (t.includes(ERROR_KEYWORD)) {
+          const t = dialog.innerText || dialog.textContent || '';
+          if (ERROR_KEYWORDS.some((kw) => t.includes(kw))) {
             reloadTriggered = true;
-            Log('检测到HLS网络错误，3秒后自动刷新页面...');
+            Log('检测到播放错误，3秒后自动刷新页面...', t.slice(0, 60));
             setTimeout(() => location.reload(), 3000);
             return;
           }
@@ -620,6 +636,7 @@
     window.__xueOpenGuardedV10 = true;
     const rawOpen = window.open.bind(window);
     const recentExamOpens = {};
+    const recentCourseOpens = {};
     window.open = function (url, name, specs) {
       const st = loadState();
       const urlStr = String(url || '');
@@ -632,7 +649,8 @@
         phase: st.phase,
         active: st.activeCourseId,
       });
-      if (cid && hasLivePlayerLock(st) && st.activeCourseId && cid !== st.activeCourseId) {
+      // 双保险：cid 相等或 URL 本身含 activeCourseId 都视为“正在开当前这门课”，放行
+      if (cid && hasLivePlayerLock(st) && st.activeCourseId && cid !== st.activeCourseId && urlStr.indexOf(st.activeCourseId) === -1) {
         LogW('拦截并发开课', { url: urlStr, active: st.activeCourseId, tryCid: cid });
         setPanel('已有课程播放中，拦截并发打开\nactive=' + st.activeCourseId);
         return null;
@@ -659,14 +677,28 @@
         }
       }
       if (cid) {
+        const now = Date.now();
+        // 同一门课短时间内的重复开课（网站一次点击会连发两次 window.open）：拦截重复，避免开两个播放标签
+        if (recentCourseOpens[cid] && now - recentCourseOpens[cid] < (CFG.courseOpenDedupMs || 6000)) {
+          LogW('拦截重复开课窗口', { cid: cid, ago: now - recentCourseOpens[cid] });
+          return null;
+        }
+        recentCourseOpens[cid] = now;
         saveState({
           activeCourseId: cid,
-          activeOpenedAt: Date.now(),
-          playerHeartbeatAt: Date.now(),
+          activeOpenedAt: now,
+          playerHeartbeatAt: now,
+          playerUnloadAt: 0,
           phase: 'playing',
           pathUrl: pageType() === 'path' ? location.href : loadState().pathUrl,
           lastAction: 'window_open_course',
         });
+        // 固定窗口名：即使后续又触发开课，也复用同一播放标签，不再新开标签
+        try {
+          return rawOpen(urlStr, '_xue_player', specs);
+        } catch (e) {
+          return rawOpen(url, name || '_blank', specs);
+        }
       }
       return rawOpen(url, name || '_blank', specs);
     };
@@ -1172,6 +1204,9 @@
   let lastAdvanceAt = Date.now();
   let finishTriggered = false;
   let sectionClickAt = 0;
+  let lastSectionClickKey = '';
+  let sameSectionClickCount = 0;
+  let replaySeekAt = 0;
 
   function getVideo() {
     return document.querySelector('video');
@@ -1241,6 +1276,34 @@
     return false;
   }
 
+  // 连续点同一目录项计数：点了也没反应说明网站从「上次学习」尾部续播，视频一进来就是播完状态
+  function trackSectionClick(key) {
+    if (key === lastSectionClickKey) sameSectionClickCount += 1;
+    else {
+      lastSectionClickKey = key;
+      sameSectionClickCount = 1;
+    }
+    return sameSectionClickCount;
+  }
+
+  // 反复点击无效时的自愈：把当前视频拉回片头重播，让服务器真正累计观看时长，状态才会变「已完成」
+  function replayFromStart(video, key) {
+    if (!video) return false;
+    if (Date.now() - replaySeekAt < 15000) return true; // 刚重播过，等它播，不再狂点
+    replaySeekAt = Date.now();
+    sectionClickAt = Date.now();
+    lastAdvanceAt = Date.now();
+    lastTime = 0;
+    try {
+      video.currentTime = 0;
+      video.muted = true;
+      video.play().catch(() => {});
+    } catch (e) {}
+    Log('同一小视频反复点击无效，改为从头重播', key);
+    setPanel('该小视频停在片尾、状态未变「已完成」\n>>> 已从头重播\n' + key.slice(0, 50) + '\n播完后状态刷新才换下一门课');
+    return true;
+  }
+
   function clickNextSectionIfNeeded(video) {
     if (!video || !isVideoFinished(video)) return false;
     if (Date.now() - sectionClickAt < 3000) return false;
@@ -1265,6 +1328,7 @@
       const el = items[i];
       if (isSectionComplete(el)) continue;
       const t = text(el);
+      if (trackSectionClick(t.slice(0, 60)) >= 3 && replayFromStart(video, t.slice(0, 60))) return true;
       const clickable =
         el.querySelector('.category-name, .course-list__item__right, a, button, .title, .name') || el;
       Log('切下一小视频', t.slice(0, 60));
@@ -1281,6 +1345,7 @@
       const el = items[i];
       if (isSectionComplete(el)) continue;
       const t = text(el);
+      if (trackSectionClick(t.slice(0, 60)) >= 3 && replayFromStart(video, t.slice(0, 60))) return true;
       const clickable =
         el.querySelector('.category-name, .course-list__item__right, a, button, .title, .name') || el;
       Log('切未完成小视频', t.slice(0, 60));
@@ -1367,6 +1432,7 @@
       activeTitle: loadState().activeTitle || document.title,
       pathUrl: loadState().pathUrl || '',
       playerHeartbeatAt: Date.now(),
+      playerUnloadAt: 0,
       lastAction: 'player_heartbeat',
       allowOpenNext: false,
     });
@@ -1380,9 +1446,11 @@
         lastTime = t;
         lastAdvanceAt = Date.now();
         finishTriggered = false;
+        sameSectionClickCount = 0; // 切到新视频了，重置反复点击计数
       } else if (!video.paused && Math.abs(t - lastTime) > 0.2) {
         lastTime = t;
         lastAdvanceAt = Date.now();
+        sameSectionClickCount = 0; // 播放在正常推进，重置反复点击计数
       }
     }
 
@@ -2030,6 +2098,16 @@
       installV54PlayerCore();
       // 2) 仅附加：播完判定与下一课编排（默认不自动回路径）
       setInterval(playerAdvanceTick, CFG.playerAdvanceMs);
+      // 3) 播放页关闭时留下信号，路径页几秒内即可释放播放锁（不用等满心跳超时）
+      window.addEventListener('pagehide', function () {
+        try {
+          const st = loadState();
+          const cid = courseIdFromUrl(location.href);
+          if (st.phase === 'playing' && cid && cid === st.activeCourseId) {
+            saveState({ playerUnloadAt: Date.now(), lastAction: 'player_unload' });
+          }
+        } catch (e) {}
+      });
       setPanel(
         '播放页已加载 v5.4 原逻辑\n附加：播完切下一小视频\n全部「已完成」才算完课\n禁止自动回跳路径\n可点「复制日志」'
       );
