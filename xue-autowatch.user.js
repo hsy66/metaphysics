@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阳光学堂自动看视频助手
 // @namespace    http://tampermonkey.net/
-// @version      11.9.0
+// @version      11.9.1
 // @description  合并版：自动看课+内置倍速引擎(面板可选 关/2/4/8/16x，仅播放页生效)；片尾最后8秒自动降1倍速自然播完+等平台确认完成(根治来回跳)；一键自动学习(跨页面带路+列表页直接判断未完成任务)；自动考试开关全局持久化。仅测试自用。
 // @author       You
 // @match        https://xue.sinosig.com/*
@@ -21,7 +21,7 @@
   }
   window.__xueAutoWatchV10Loaded = true;
 
-  const VER = '11.9.0';
+  const VER = '11.9.1';
   const TAG = '[学堂助手]';
   const STORE_KEY = 'xue_auto_watch_v10';
   const LOG_KEY = 'xue_auto_watch_v10_logs';
@@ -1231,16 +1231,32 @@
       };
     })();
 
-    // ========== 核心2：防切屏（保留原逻辑） ==========
+    // ========== 核心2：防切屏（保留原逻辑；改写失败只降级不抛错） ==========
+    // 实测有的环境 document 实例上已有不可配置的 hidden 属性，直接 defineProperty 会抛
+    // TypeError 把后面所有核心（自动播放/切课编排）一起带崩 —— 必须逐项兜底
     (function antiBlur() {
-      Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-      Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-      const originalAddEventListener = document.addEventListener;
-      document.addEventListener = function (type, listener, options) {
-        if (String(type || '').includes('visibility')) return;
-        return originalAddEventListener.call(this, type, listener, options);
-      };
-      document.hasFocus = () => true;
+      [
+        ['hidden', function () { return false; }],
+        ['visibilityState', function () { return 'visible'; }],
+      ].forEach(function (pair) {
+        try {
+          Object.defineProperty(document, pair[0], { get: pair[1], configurable: true });
+        } catch (e1) {
+          try {
+            Object.defineProperty(Object.getPrototypeOf(document), pair[0], { get: pair[1], configurable: true });
+          } catch (e2) {
+            LogW('防切屏：document.' + pair[0] + ' 无法改写（跳过该子项）', String(e2).slice(0, 60));
+          }
+        }
+      });
+      try {
+        const originalAddEventListener = document.addEventListener;
+        document.addEventListener = function (type, listener, options) {
+          if (String(type || '').includes('visibility')) return;
+          return originalAddEventListener.call(this, type, listener, options);
+        };
+        document.hasFocus = () => true;
+      } catch (e3) {}
     })();
 
     // ========== 核心3：控制栏常显+自动播放+强制静音 ==========
@@ -1260,8 +1276,8 @@
           Log('已自动静音');
         }
 
-        // 自动播放
-        if (video.paused) {
+        // 自动播放（本课已完课时不拉起：平台会把已完成的视频自动循环重播）
+        if (video.paused && !finishTriggered) {
           video.play().catch((err) => {
             Log('自动播放被阻止', err && err.message);
           });
@@ -1501,13 +1517,34 @@
     }
   }
 
+  // 报名类按钮文案（自定义课程的「我要学习」是 div.course-state-btn，不是 button/a）
+  const ENROLL_TEXTS = ['我要学习', '立即学习', '报名学习', '参加学习'];
+
+  function looksLikeEnrollControl(el) {
+    // 按「叶子节点 + 按钮尺寸 + 指针光标/按钮样式类名」识别非标准标签的报名按钮
+    if (!el || el.children.length > 0) return false;
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (e) { return false; }
+    if (r.width < 20 || r.width > 400 || r.height < 12 || r.height > 80) return false;
+    if (!isVisible(el)) return false;
+    const cls = String(el.className || '');
+    let pointer = false;
+    try { pointer = getComputedStyle(el).cursor === 'pointer'; } catch (e) {}
+    return pointer || /btn|button/i.test(cls);
+  }
+
   function findEnrollButton() {
     const candidates = qsa('button, a, .btn, [role="button"]').filter((el) => {
       const t = text(el);
       if (!t) return false;
-      if (!(t === '我要学习' || t === '立即学习' || t === '报名学习' || t === '参加学习')) return false;
+      if (ENROLL_TEXTS.indexOf(t) < 0) return false;
       return isVisible(el);
     });
+    // 兜底：div/span 等非标准标签的报名按钮（实测 div.course-state-btn 文案「我要学习」）
+    if (!candidates.length) {
+      const leaf = qsa('div, span').find((el) => ENROLL_TEXTS.indexOf(text(el)) >= 0 && looksLikeEnrollControl(el));
+      if (leaf) candidates.push(leaf);
+    }
     return (
       candidates.find((el) => el.tagName === 'BUTTON' && !el.disabled && el.getAttribute('disabled') == null) ||
       candidates.find((el) => el.tagName === 'BUTTON') ||
@@ -2230,8 +2267,16 @@
     if (!document.body) return;
     // 防僵尸：本标签 SPA 跳去了别的页面类型时，立即停止心跳/切课逻辑
     if (pageType() !== 'player') return;
-    // 完课后等待期间，心跳绝不能把 course_done 覆盖回 playing
-    if (finishTriggered) return;
+    // 完课后等待期间，心跳绝不能把 course_done 覆盖回 playing；
+    // 平台会自动循环重播已完成的视频，顺手暂停（核心3已联动不会重复拉起）
+    if (finishTriggered) {
+      const fv = getVideo();
+      if (fv && !fv.paused) {
+        try { fv.pause(); } catch (e) {}
+        Log('本课已完成，已暂停平台自动循环重播');
+      }
+      return;
+    }
     const video = getVideo();
     const stats = sectionStats();
     const cid = courseIdFromUrl(location.href);
@@ -2255,13 +2300,16 @@
     // 学习按钮：自定义/公开课程的播放页要先点「学习/我要学习」才开始登记学习记录。
     // 成长计划路径开出来的课没有这个按钮，不受影响（带节流，点过一次就不再点）
     if (realNow() - lastEnrollBtnAt > 5000) {
-      const enrollBtn =
-        findEnrollButton() ||
-        qsa('button, a, [role="button"]').find((el) => text(el) === '学习' && isVisible(el)) ||
-        null;
+      let enrollBtn = findEnrollButton();
+      if (!enrollBtn) {
+        enrollBtn =
+          qsa('button, a, [role="button"]').find((el) => text(el) === '学习' && isVisible(el)) ||
+          qsa('div, span').find((el) => text(el) === '学习' && looksLikeEnrollControl(el)) ||
+          null;
+      }
       if (enrollBtn) {
         lastEnrollBtnAt = realNow();
-        LogA('检测到「学习」按钮，点击开始学习', { text: text(enrollBtn) });
+        LogA('检测到「学习」按钮，点击开始学习', { text: text(enrollBtn), tag: enrollBtn.tagName, cls: String(enrollBtn.className).slice(0, 40) });
         setPanel('检测到「学习」按钮\n>>> 点击开始学习');
         safeClick(enrollBtn, '播放页学习按钮');
         return;
@@ -3109,8 +3157,12 @@
           }).observe(document.body, { childList: true, subtree: true });
         } catch (e) {}
       }
-      // 1) 严格加载你验证过的 v5.4
-      installV54PlayerCore();
+      // 1) 严格加载你验证过的 v5.4（任何子核心启动失败都不能阻断后面的切课编排）
+      try {
+        installV54PlayerCore();
+      } catch (e) {
+        LogW('v5.4 播放核心部分功能启动失败（不影响自动切课）', String(e).slice(0, 80));
+      }
       // 2) 仅附加：播完判定与下一课编排（默认不自动回路径）
       setInterval(playerAdvanceTick, CFG.playerAdvanceMs);
       // 3) 播放页关闭时留下信号，路径页几秒内即可释放播放锁（不用等满心跳超时）
