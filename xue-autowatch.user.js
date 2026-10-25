@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阳光学堂自动看视频助手
 // @namespace    http://tampermonkey.net/
-// @version      11.9.2
+// @version      11.9.3
 // @description  合并版：自动看课+内置倍速引擎(面板可选 关/2/4/8/16x，仅播放页生效)；片尾最后8秒自动降1倍速自然播完+等平台确认完成(根治来回跳)；一键自动学习(跨页面带路+列表页直接判断未完成任务)；自动考试开关全局持久化。仅测试自用。
 // @author       You
 // @match        https://xue.sinosig.com/*
@@ -21,7 +21,7 @@
   }
   window.__xueAutoWatchV10Loaded = true;
 
-  const VER = '11.9.2';
+  const VER = '11.9.3';
   const TAG = '[学堂助手]';
   const STORE_KEY = 'xue_auto_watch_v10';
   const LOG_KEY = 'xue_auto_watch_v10_logs';
@@ -2272,6 +2272,11 @@
     if (finishTriggered) {
       const fv = getVideo();
       if (fv && !fv.paused) {
+        // 进度条对齐：16倍速下平台按上报进度先判完成，视频物理位置可能没到头，
+        // 拉到片尾再暂停，避免"课程已完成但进度条只有八成"的观感（不伪造上报，完成是平台判的）
+        try {
+          if (fv.duration && fv.currentTime < fv.duration - 1) fv.currentTime = fv.duration - 0.5;
+        } catch (e) {}
         try { fv.pause(); } catch (e) {}
         Log('本课已完成，已暂停平台自动循环重播');
       }
