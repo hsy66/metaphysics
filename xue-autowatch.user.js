@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         阳光学堂自动看视频助手
 // @namespace    http://tampermonkey.net/
-// @version      11.9.1
+// @version      11.9.2
 // @description  合并版：自动看课+内置倍速引擎(面板可选 关/2/4/8/16x，仅播放页生效)；片尾最后8秒自动降1倍速自然播完+等平台确认完成(根治来回跳)；一键自动学习(跨页面带路+列表页直接判断未完成任务)；自动考试开关全局持久化。仅测试自用。
 // @author       You
 // @match        https://xue.sinosig.com/*
@@ -21,7 +21,7 @@
   }
   window.__xueAutoWatchV10Loaded = true;
 
-  const VER = '11.9.1';
+  const VER = '11.9.2';
   const TAG = '[学堂助手]';
   const STORE_KEY = 'xue_auto_watch_v10';
   const LOG_KEY = 'xue_auto_watch_v10_logs';
@@ -2772,8 +2772,10 @@
       return lastModalKind || 'wait';
     }
     const confirmBtn = findVisibleModalButton(['确认', '确定']);
+    // 只取真正可见的弹窗文字：display:block 的元素在 display:none 父级下也能通过旧判断，
+    // 隐藏的结果弹窗模板文字被误拼进来 → 误判"结果弹窗"反复空点（实测踩坑）
     const modalText = qsa('.modal, .modal-dialog, [role=dialog]')
-      .filter((m) => isVisible(m) || getComputedStyle(m).display === 'block')
+      .filter((m) => m.offsetParent !== null || (m.getClientRects && m.getClientRects().length > 0))
       .map((m) => text(m))
       .join(' ');
     if (confirmBtn && /交卷|提交|无法更改|是否确定/.test(modalText + text(confirmBtn.parentElement || document.body))) {
