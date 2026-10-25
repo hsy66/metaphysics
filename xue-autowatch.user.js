@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         阳光学堂自动看视频助手
 // @namespace    http://tampermonkey.net/
-// @version      10.3.11
-// @description  播放页严格v5.4；课内全「已完成」才算完课；自动考试(修冷却卡死/手动考试清锁/正式开考)；默认禁止自动回跳路径。仅测试自用。
+// @version      11.9.0
+// @description  合并版：自动看课+内置倍速引擎(面板可选 关/2/4/8/16x，仅播放页生效)；片尾最后8秒自动降1倍速自然播完+等平台确认完成(根治来回跳)；一键自动学习(跨页面带路+列表页直接判断未完成任务)；自动考试开关全局持久化。仅测试自用。
 // @author       You
 // @match        https://xue.sinosig.com/*
 // @grant        none
 // @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/hsy66/metaphysics/main/xue-autowatch.user.js
+// @downloadURL  https://raw.githubusercontent.com/hsy66/metaphysics/main/xue-autowatch.user.js
 // ==/UserScript==
 
 (function () {
@@ -19,13 +21,196 @@
   }
   window.__xueAutoWatchV10Loaded = true;
 
-  const VER = '10.3.11';
+  const VER = '11.9.0';
   const TAG = '[学堂助手]';
   const STORE_KEY = 'xue_auto_watch_v10';
   const LOG_KEY = 'xue_auto_watch_v10_logs';
   const ANS_KEY = 'xue_auto_exam_answers_v10';
-  const BOOT_AT = Date.now();
+  const BOOT_AT = realNow();
   const PAGE_ID = Math.random().toString(36).slice(2, 8);
+  // 跨标签真实时钟：16倍速脚本会把播放页的 Date.now 改快，导致各标签时间戳不可比
+  // （心跳/冷却/租约全部错乱）。16倍速脚本会在 window.__xueRealNow 暴露真实时间；
+  // 未开启倍速脚本时退回 Date.now（本页没被加速，同样是真实时间）。
+  function realNow() {
+    try {
+      if (typeof window.__xueRealNow === 'function') return window.__xueRealNow();
+    } catch (e) {}
+    return Date.now();
+  }
+  // 本标签启动时的页面类型（SPA 类型切换检测用）
+  let bootPageType = '';
+
+  // =====================================================================
+  // 内置倍速引擎（由独立「16倍速」脚本合并而来，v11.0.0 起无需单独安装）
+  // - 仅在课程播放页挂钩计时器/Date：路径/考试/结果页保持原生节奏，
+  //   不干扰考试的答题间隔与≥1分钟交卷延迟，也不打乱脚本冷却判断
+  // - 面板可选 关/2/4/8/16x，选择存 localStorage（跨标签即时生效）
+  // - 片尾最后8秒由播放编排层通过 speedTailOverride 联动降为1倍速自然播完
+  // =====================================================================
+  const SPEED_KEY = 'xue_speed_cfg_v11';
+  let speedInstalled = false;
+  let speedOrigSetInterval = null;
+  let speedOrigSetTimeout = null;
+  let speedOrigDateNow = null;
+  // >0 时视频临时用该倍速（片尾1倍速自然播完），优先于用户设置
+  let speedTailOverride = 0;
+
+  function loadSpeedCfg() {
+    try {
+      const c = JSON.parse(localStorage.getItem(SPEED_KEY));
+      if (c && typeof c === 'object') return { on: !!c.on, rate: Number(c.rate) || 16 };
+    } catch (e) {}
+    return { on: true, rate: 16 };
+  }
+  function saveSpeedCfg(c) {
+    try {
+      localStorage.setItem(SPEED_KEY, JSON.stringify(c));
+    } catch (e) {}
+    return c;
+  }
+  function getSpeedRate() {
+    const c = loadSpeedCfg();
+    return c.on ? c.rate : 0;
+  }
+  function isPlayerUrl() {
+    return /courseDetail\//.test(location.href);
+  }
+  function currentTargetRate() {
+    if (speedTailOverride > 0) return speedTailOverride;
+    const r = getSpeedRate();
+    return r > 0 ? r : 1;
+  }
+
+  function installSpeedHooks() {
+    if (speedInstalled) return;
+    speedInstalled = true;
+    speedOrigSetInterval = window.setInterval.bind(window);
+    speedOrigSetTimeout = window.setTimeout.bind(window);
+    speedOrigDateNow = Date.now.bind(Date);
+    // 计时器加速：倍速选择动态读取，改设置不用重挂
+    window.setInterval = function (fn, delay, ...args) {
+      if (typeof delay === 'number' && delay > 0) {
+        const r = getSpeedRate();
+        if (r > 0) delay = Math.max(1, Math.floor(delay / r));
+      }
+      return speedOrigSetInterval(fn, delay, ...args);
+    };
+    window.setTimeout = function (fn, delay, ...args) {
+      if (typeof delay === 'number' && delay > 0) {
+        const r = getSpeedRate();
+        if (r > 0) delay = Math.max(1, Math.floor(delay / r));
+      }
+      return speedOrigSetTimeout(fn, delay, ...args);
+    };
+    // 页面时间加速；同时把真实时间暴露在 window.__xueRealNow，
+    // realNow() 统一用它做跨标签时间戳（心跳/冷却/租约）
+    let lastReal = speedOrigDateNow();
+    let lastFake = lastReal;
+    Date.now = function () {
+      const now = speedOrigDateNow();
+      const diff = now - lastReal;
+      lastReal = now;
+      const r = getSpeedRate();
+      lastFake += diff * (r > 0 ? r : 1);
+      return lastFake;
+    };
+    try {
+      window.__xueRealNow = speedOrigDateNow;
+    } catch (e) {}
+    Log('倍速引擎已挂钩', loadSpeedCfg());
+  }
+
+  function restoreSpeedHooks() {
+    if (!speedInstalled) return;
+    try {
+      if (speedOrigSetInterval) window.setInterval = speedOrigSetInterval;
+      if (speedOrigSetTimeout) window.setTimeout = speedOrigSetTimeout;
+      if (speedOrigDateNow) Date.now = speedOrigDateNow;
+    } catch (e) {}
+    speedInstalled = false;
+    speedTailOverride = 0;
+    try {
+      window.__xueRealNow = undefined;
+    } catch (e) {}
+    Log('倍速引擎已还原（计时器/时钟恢复原生）');
+  }
+
+  function hackVideoSpeed() {
+    if (!isPlayerUrl()) return;
+    const rate = getSpeedRate();
+    if (rate <= 0 && speedTailOverride <= 0) return; // 倍速关闭时不干预播放器
+    const target = currentTargetRate();
+    try {
+      qsa('video').forEach(function (video) {
+        if (video.playbackRate !== target) {
+          // 高倍速个别浏览器/视频会拒绝，逐级回落
+          for (const r of [target, 8, 4, 2, 1]) {
+            if (r > target) continue;
+            try {
+              video.playbackRate = r;
+              break;
+            } catch (e) {}
+          }
+        }
+      });
+    } catch (e) {}
+  }
+
+  // 面板切换倍速后的立即生效逻辑
+  function applySpeedNow() {
+    const c = loadSpeedCfg();
+    if (c.on && isPlayerUrl()) {
+      installSpeedHooks();
+      hackVideoSpeed();
+    } else if (!c.on) {
+      if (speedInstalled) restoreSpeedHooks();
+      try {
+        qsa('video').forEach(function (v) {
+          try {
+            v.playbackRate = 1;
+          } catch (e) {}
+        });
+      } catch (e) {}
+    }
+    refreshSpeedRowUI();
+  }
+
+  function refreshSpeedRowUI() {
+    try {
+      const box = qs('#xue-auto-panel');
+      if (!box) return;
+      const c = loadSpeedCfg();
+      qsa('.xue-speed-btn', box).forEach(function (b) {
+        const r = Number(b.getAttribute('data-rate')) || 0;
+        const active = c.on ? c.rate === r : r === 0;
+        b.style.background = active ? '#10b981' : '#374151';
+      });
+    } catch (e) {}
+  }
+
+  // 动作按钮（复制日志/重置状态）点击反馈：执行时闪绿，随后恢复统一底色
+  function flashButton(btn, ms) {
+    if (!btn) return;
+    try {
+      btn.style.background = '#10b981';
+      setTimeout(function () {
+        btn.style.background = '#374151';
+      }, ms || 800);
+    } catch (e) {}
+  }
+
+  // 功能按钮配色与倍速按钮一致：未开启=黑色(#374151)，开启=绿色(#10b981)
+  // 「自动考试」「自动学习」都是全局持久化开关：点开即绿、再点停止变黑
+  function refreshToggleButtons() {
+    try {
+      const box = qs('#xue-auto-panel');
+      if (!box) return;
+      const bExam = qs('#xue-auto-exam', box);
+      if (bExam) bExam.style.background = isAutoExamOn() ? '#10b981' : '#374151';
+      const bStart = qs('#xue-auto-start', box);
+      if (bStart) bStart.style.background = isAutoLearnOn() ? '#10b981' : '#374151';
+    } catch (e) {}
+  }
 
   // 你的规则：待考试 / 重新学习 = 这门课视频已看完（不再自动点）
   // 待考试 / 开始考试 / 重新考试 = 需要考试
@@ -38,7 +223,7 @@
     // 用户负责打开「我的学习→专属成长计划→具体任务」；脚本默认不自动点计划卡片
     autoOpenPlan: false,
     // 路径页：默认自动点「开始/继续学习」自动刷课
-    // 如需改回手动（防连环开课/弹窗重定向），把此项改为 false，或用面板「开下一门」
+    // 如需改回手动（防连环开课/弹窗重定向），把此项改为 false，或用面板「自动学习」
     autoOpenFromPath: true,
     openNextOnlyAfterCourseDone: true,
     // 同时只开一门视频课
@@ -59,7 +244,7 @@
     allowHistoryBack: false,
     allowPathReload: false,
     // 关键：默认禁止播放页自动 location 回路径（这是“学着学着又回课程选择”的主因）
-    // 完课后只写状态+日志；你在路径页点「开下一门」或手动回去
+    // 完课后只写状态+日志；路径操作标签会自动开下一门
     autoReturnToPath: false,
     // 进入播放页后至少停留这么久，才允许判定完课（防刚进已完成目录就回跳）
     minStayBeforeFinishMs: 20000,
@@ -122,7 +307,7 @@
   function pushLog(level, msg, data) {
     const row = {
       t: ts(),
-      ms: Date.now() - BOOT_AT,
+      ms: realNow() - BOOT_AT,
       pageId: PAGE_ID,
       level: level,
       page: (function () {
@@ -272,13 +457,13 @@
   }
   function saveState(patch) {
     const prev = loadState();
-    const next = Object.assign({}, prev, patch, { updatedAt: Date.now() });
+    const next = Object.assign({}, prev, patch, { updatedAt: realNow() });
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(next));
     } catch (e) {}
     if (CFG.verboseLog && patch) {
       const keys = Object.keys(patch);
-      if (keys.some((k) => k !== 'playerHeartbeatAt' && k !== 'updatedAt')) {
+      if (keys.some((k) => k !== 'playerHeartbeatAt' && k !== 'updatedAt' && k !== 'pathWorker')) {
         Log('saveState', {
           patch: patch,
           phase: next.phase,
@@ -289,6 +474,480 @@
       }
     }
     return next;
+  }
+
+  // ============ 跨标签公共辅助 ============
+  // 自动考试开关持久化：考试流程跨多个标签（路径→考试→结果），只改本标签内存 CFG 会在
+  // 新开的考试/结果标签里全部失效（旧版考试流程断链的根本原因）。开关写入 localStorage，
+  // 所有标签读同一个值；面板「自动考试」按钮切换，「重置状态」清除。
+  function isAutoExamOn() {
+    if (CFG.autoExam) return true;
+    try {
+      return !!loadState().autoExamOn;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 自动学习总开关（全局持久化）：开启后才会自动开课/自动换任务；关闭=纯手动浏览
+  function isAutoLearnOn() {
+    try {
+      return !!loadState().autoLearnOn;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 路径「操作标签」租约：播放页/考试页回到路径后会产生多个路径标签，若都执行点击
+  // 会重复开课/开考。全站同一时刻只允许一个标签（持租约者）执行点击，其余仅监控。
+  const WORKER_LEASE_MS = 20000;
+  function amPathWorker(st) {
+    const s = st || loadState();
+    const lease = s.pathWorker || {};
+    const now = realNow();
+    if (lease.id === PAGE_ID || !lease.id || now - (lease.at || 0) > WORKER_LEASE_MS) {
+      if (lease.id !== PAGE_ID) Log('接管路径操作权', { prevId: lease.id, prevAt: lease.at });
+      saveState({ pathWorker: { id: PAGE_ID, at: now } });
+      return true;
+    }
+    return false;
+  }
+  function claimPathWorker() {
+    saveState({ pathWorker: { id: PAGE_ID, at: realNow() } });
+  }
+
+  // 记录已通过的考试：路径页DOM状态不刷新时，防止对已通过考试无限重考
+  function recordExamPassed(src) {
+    const st = loadState();
+    const id = st.examId || examIdFromUrl() || '';
+    const title = normalizeQTitle(st.examTitle || getExamTitle());
+    if (!id && !title) return;
+    const passed = Array.isArray(st.passedExams) ? st.passedExams.slice() : [];
+    if (passed.some((p) => (p.id && p.id === id) || (p.title && p.title === title))) return;
+    passed.push({ id: id, title: title, at: realNow() });
+    saveState({ passedExams: passed, lastAction: 'exam_passed:' + src });
+    LogA('记录考试通过，后续不再自动重考', { id: id, title: title, src: src });
+  }
+  function detectResultPass() {
+    try {
+      const t = text(document.body).slice(0, 5000);
+      if (/未通过|不及格|遗憾/.test(t)) return false;
+      if (/通过考试|考试通过|恭喜通过/.test(t)) return true;
+      const m = t.match(/(\d+(?:\.\d+)?)\s*分/);
+      if (m && parseFloat(m[1]) >= 60) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // SPA 页面类型切换 → 整页重启：hash 路由切换不会重载脚本，旧页面类型的定时器
+  // （心跳/回跳/轮询）会残留成“僵尸”，把新页面的状态搅乱。检测到类型变化直接 reload。
+  let __typeReloadAt = 0;
+  function maybeReloadOnTypeChange(prevType) {
+    try {
+      const nt = pageType();
+      if (!prevType || nt === prevType) return;
+      if (['path', 'player', 'exam', 'exam_result', 'study'].indexOf(nt) < 0) return;
+      if (realNow() - __typeReloadAt < 5000) return;
+      __typeReloadAt = realNow();
+      LogN('SPA页面类型切换 ' + prevType + ' → ' + nt + '，400ms后整页重启（清理旧页面残留定时器）');
+      setTimeout(function () {
+        location.reload();
+      }, 400);
+    } catch (e) {}
+  }
+
+  // ============ 一键「自动学习」跨页面引导 ============
+  // 点「自动学习」后无论在哪个页面，自动带路到成长计划路径页并开始学习：
+  //   路径页 → 直接开始；我的学习页 → 自动点「专属成长计划」→ 点具体任务；
+  //   其它页面 → 回上次的路径页（若已学完则去我的学习页找新任务）。
+  // 状态存 localStorage，跨页面跳转后继续；90秒未到达自动放弃并给出指引。
+  const BOOT_KEY = 'xue_bootstrap_v11';
+  const STUDY_URL = 'https://xue.sinosig.com/xue-student-web/person/study';
+  const BOOT_TIMEOUT_MS = 180000;
+
+  function loadBootstrap() {
+    try {
+      return JSON.parse(localStorage.getItem(BOOT_KEY)) || {};
+    } catch (e) {
+      return {};
+    }
+  }
+  function saveBootstrap(b) {
+    try {
+      if (b) localStorage.setItem(BOOT_KEY, JSON.stringify(b));
+      else localStorage.removeItem(BOOT_KEY);
+    } catch (e) {}
+    return b;
+  }
+
+  // 按文本找可点元素：文本最短的最精确（恰是按钮本身，而不是包含它的大卡片）；
+  // excludeArr 传入「已学完任务的入口文本」，用于逐个换下一个任务
+  function findClickableByText(regex, maxLen, excludeArr) {
+    const ex = Array.isArray(excludeArr) ? excludeArr : [];
+    const cands = qsa('a, button, [role="button"], .item, .card, li, span, p, div').filter(function (el) {
+      const t = text(el);
+      if (!t || t.length > (maxLen || 40)) return false;
+      if (!regex.test(t)) return false;
+      if (ex.indexOf(t) >= 0) return false;
+      return isVisible(el);
+    });
+    cands.sort(function (a, b) {
+      return text(a).length - text(b).length;
+    });
+    return cands[0] || null;
+  }
+
+  // 「专属成长计划」任务卡片扫描：默认「全部」页签直接判断哪些任务没学完。
+  // 现场验证过的容器：.course-item（带100%进度）、.plan-item（计划视图分组头/卡片）；
+  // 标题不依赖固定类名——在容器后代里找「含任务特征词的最长文本」，
+  // 并排除"目标天数/已注册"这类元信息（曾因此把"目标天数：无1973人已注册"当成任务名）
+  function scanStudyTaskCards() {
+    const cards = [];
+    const seen = {};
+    const TASK_RE = /【.+】|条线|必修|季度|计划|任务|培训|教育|课程|学习/;
+    const META_RE = /目标天数|已注册|已报名|人已学|学习进度/;
+    function cardFinished(cardText) {
+      // 明确「已完成/已学完/100%」且无未完成字样 → 学完；进度分子<分母 → 未学完
+      let fin = /已完成|已学完|100%/.test(cardText) && !/未完成|学习中|进行中|未开始|未学习/.test(cardText);
+      const pm = cardText.match(/(\d+)\s*\/\s*(\d+)/);
+      if (pm && Number(pm[1]) < Number(pm[2])) fin = false;
+      return fin;
+    }
+    const containers = qsa('.course-item, .common-item, .task-item, .plan-item');
+    containers.forEach(function (card) {
+      if (!isVisible(card)) return;
+      const cardText = text(card);
+      // 短文本是"学习任务/IDP课程"这类分组头，不是任务卡
+      if (!cardText || cardText.length < 10) return;
+      // 后代里找标题：优先含任务特征词的最长 6-80 字文本；元信息文本不参与
+      let hitEl = null;
+      let hitText = '';
+      let anyEl = null;
+      let anyText = '';
+      qsa('*', card).forEach(function (el2) {
+        const tt = text(el2);
+        if (tt.length < 6 || tt.length > 80 || tt === cardText) return;
+        if (META_RE.test(tt)) return;
+        if (tt.length > anyText.length) {
+          anyText = tt;
+          anyEl = el2;
+        }
+        if (TASK_RE.test(tt) && tt.length > hitText.length) {
+          hitText = tt;
+          hitEl = el2;
+        }
+      });
+      const title = (hitText || anyText || cardText).slice(0, 60);
+      const clickEl = hitEl || anyEl || card;
+      if (seen[title]) return;
+      seen[title] = true;
+      cards.push({
+        el: clickEl,
+        title: title,
+        cardText: cardText.slice(0, 150),
+        finished: cardFinished(cardText.slice(0, 150)),
+      });
+    });
+    return cards;
+  }
+
+  function bootstrapFail(msg, stay) {
+    saveBootstrap(null);
+    // 引导结束：自动学习回到关闭状态（按钮变黑）
+    saveState({ autoLearnOn: false, lastAction: 'bootstrap_fail' });
+    LogW('自动学习引导结束：' + msg);
+    const st = loadState();
+    setPanel(
+      msg +
+        '\n自动学习已结束（按钮变黑）\n' +
+        (stay
+          ? '如需重试请再点「自动学习」'
+          : st.pathUrl
+            ? '2.5s后回到上次的路径页\n可再点「自动学习」重试'
+            : '可再点「自动学习」重试')
+    );
+    if (!stay && st.pathUrl) {
+      setTimeout(function () {
+        location.href = st.pathUrl;
+      }, 2500);
+    }
+  }
+
+  function startBootstrap() {
+    saveBootstrap({ active: true, step: 'start', startedAt: realNow(), tries: 0 });
+    bootstrapTick();
+  }
+
+  function bootstrapTick() {
+    const b = loadBootstrap();
+    if (!b || !b.active) return;
+    if (!document.body) return;
+    if (realNow() - (b.startedAt || 0) > BOOT_TIMEOUT_MS) {
+      bootstrapFail('3分钟内未到达路径页');
+      return;
+    }
+    const t = pageType();
+    const st = loadState();
+
+    // ① 已在路径页：到达（或本路径已学完 → 换下一个任务）
+    if (t === 'path') {
+      // 刚标记完“本路径已学完”，正在等跳去我的学习页找下一个任务
+      if (b.step === 'goto_study') {
+        saveBootstrap(b);
+        return;
+      }
+      const finList = Array.isArray(st.finishedPathUrls) ? st.finishedPathUrls : [];
+      if (finList.indexOf(pathKey(location.href)) >= 0) {
+        // 又进了一个已学完的路径：把刚才点的任务记为“试过”，回去换下一个
+        const tried = Array.isArray(b.triedTasks) ? b.triedTasks.slice() : [];
+        if (b.lastTaskText && tried.indexOf(b.lastTaskText) < 0) tried.push(b.lastTaskText);
+        saveBootstrap({
+          active: true,
+          step: 'goto_study',
+          startedAt: b.startedAt,
+          tries: (b.tries || 0) + 1,
+          triedTasks: tried,
+          lastTaskText: '',
+        });
+        LogW('自动学习：这个任务的视频已全部学完，回学习页换下一个');
+        setPanel('这个任务的视频已学完\n>>> 回「我的学习」换下一个任务…');
+        setTimeout(function () {
+          location.href = STUDY_URL;
+        }, 1200);
+        return;
+      }
+      // 记住刚点进来的任务名：本路径学完后回学习页要跳过它（triedTasks 的种子，
+      // 否则引导被清空、任务名丢失 → 回列表后反复点进同一个已学完的任务）
+      if (b.lastTaskText) saveState({ lastTaskEntered: b.lastTaskText });
+      saveBootstrap(null);
+      claimPathWorker();
+      saveState({
+        phase: 'path_running',
+        activeCourseId: '',
+        activeTitle: '',
+        playerHeartbeatAt: 0,
+        lastAction: 'bootstrap_arrived',
+        allowOpenNext: true,
+        forceOpenOnce: true,
+      });
+      LogA('自动学习：已到达路径页，开始自动学习');
+      setPanel('✓ 已进入成长计划路径页\n开始自动学习');
+      setTimeout(function () {
+        pathLoop(true);
+      }, 600);
+      return;
+    }
+
+    // 已在播放页：已经在学习中，无需引导
+    if (t === 'player') {
+      saveBootstrap(null);
+      setPanel('已在课程播放页学习中\n播完会自动开下一门');
+      return;
+    }
+
+    // 考试页：别乱动，取消引导
+    if (t === 'exam' || t === 'exam_result') {
+      saveBootstrap(null);
+      return;
+    }
+
+    // ② 我的学习页：先进入「专属成长计划」，再从任务列表挑「未完成」的任务。
+    //    完成状态在列表页就能判断（已完成/100%/进度），已完成的任务绝不点进去
+    if (t === 'study') {
+      if (b.step === 'start' || b.step === 'goto_study') {
+        b.step = 'find_plan';
+        b.planTries = 0;
+        LogN('自动学习步骤：find_plan（我的学习页）');
+      }
+
+      // 1) 先进入「专属成长计划」：入口未激活就点它（冷却+次数上限），别急着点卡片
+      const plan = findClickableByText(/专属成长计划/, 20) || findClickableByText(/成长计划/, 20);
+      const planActive = plan ? /active|current|selected/.test(String(plan.className || '')) : false;
+      if (plan && !planActive) {
+        if ((b.planTries || 0) >= 5) {
+          bootstrapFail('点了「专属成长计划」但页面没有切换');
+          return;
+        }
+        if (b.lastPlanClickAt && realNow() - b.lastPlanClickAt < 5000) {
+          saveBootstrap(b);
+          setPanel('自动学习引导中…\n等待「专属成长计划」展开…');
+          return;
+        }
+        b.planTries = (b.planTries || 0) + 1;
+        b.noTaskTicks = 0;
+        b.lastPlanClickAt = realNow();
+        saveBootstrap(b);
+        LogA('自动学习：点击「专属成长计划」入口', { tries: b.planTries });
+        setPanel('自动学习引导中…\n① 进入「专属成长计划」');
+        safeClick(plan, '自动学习:成长计划入口');
+        return;
+      }
+
+      // 2) 已在成长计划视图：默认「全部」页签本身就展示所有任务，
+      //    直接扫卡片判断完成状态即可（已完成的绝不点，不逐个翻分类页签）
+      const triedTasks = Array.isArray(b.triedTasks) ? b.triedTasks : [];
+      const cards = scanStudyTaskCards();
+      const target =
+        cards.find(function (c) {
+          return !c.finished && triedTasks.indexOf(c.title) < 0;
+        }) || null;
+
+      if (target) {
+        if ((b.taskTries || 0) > 15) {
+          bootstrapFail('点了任务卡片但没进入路径页');
+          return;
+        }
+        // 点击冷却：刚点过任务就等页面跳转，不重复点、不开第二个标签
+        if (b.lastTaskClickAt && realNow() - b.lastTaskClickAt < 8000) {
+          saveBootstrap(b);
+          setPanel('已点击任务，等待进入…\n' + target.title.slice(0, 40));
+          return;
+        }
+        b.taskTries = (b.taskTries || 0) + 1;
+        b.noTaskTicks = 0;
+        b.lastTaskClickAt = realNow();
+        b.lastTaskText = target.title;
+        saveBootstrap(b);
+        LogA('自动学习：点击未完成任务', {
+          tries: b.taskTries,
+          text: target.title.slice(0, 30),
+          任务总数: cards.length,
+        });
+        setPanel('自动学习引导中…\n② 点击未完成任务\n' + target.title.slice(0, 40));
+        safeClick(target.el, '自动学习:未完成任务入口');
+        return;
+      }
+
+      // 3) 没有未完成任务：等几拍复查 → 无课可学
+      //    判定前输出完整现场诊断（含卡片容器原始文字），杜绝"读错界面/漏识别看不出"
+      b.noTaskTicks = (b.noTaskTicks || 0) + 1;
+      if (b.noTaskTicks < 4) {
+        saveBootstrap(b);
+        const rawContainers = qsa('.course-item, .common-item, .task-item, .plan-item');
+        setPanel(
+          cards.length
+            ? '任务共 ' + cards.length + ' 项，均已完成/已试过\n稍等复查…'
+            : '等待任务列表加载…\n(检测到卡片容器 ' + rawContainers.length + ' 个)'
+        );
+        return;
+      }
+      LogW('任务卡片扫描结果(无课判定依据)', {
+        卡片数: cards.length,
+        明细: cards.map(function (c) {
+          return { 任务: c.title.slice(0, 24), 已完成: c.finished, 卡面: c.cardText.slice(0, 60) };
+        }),
+        容器原文: qsa('.course-item, .common-item, .task-item, .plan-item')
+          .slice(0, 6)
+          .map(function (el) {
+            return (String(el.className) + ' | ' + text(el)).slice(0, 120);
+          }),
+        已试过: triedTasks.length,
+        顶部菜单: qsa('.top-bar-menu__item')
+          .map(function (el) {
+            return text(el) + (/active|current|selected/.test(String(el.className || '')) ? '(激活)' : '');
+          })
+          .slice(0, 8),
+        页签: qsa('.tab-item')
+          .map(function (el) {
+            return text(el) + (/active|current|selected/.test(String(el.className || '')) ? '(当前)' : '');
+          })
+          .join('/'),
+        页面摘要: String((document.body && document.body.innerText) || '')
+          .replace(/\s+/g, ' ')
+          .slice(0, 200),
+      });
+      bootstrapFail(
+        cards.length
+          ? '无课可学：任务列表里的任务都已完成'
+          : '无课可学：没识别到任务卡片（详见日志容器原文）',
+        true
+      );
+      return;
+    }
+
+    // ③ 其它页面（首页等）：上条路径已学完 → 去我的学习页找新任务；
+    //    否则直接回上次的路径页最快
+    if (b.step === 'start') {
+      const prevDone = st.phase === 'path_done' || st.phase === 'path_all_done';
+      if (st.pathUrl && !prevDone) {
+        b.step = 'goto_path';
+        saveBootstrap(b);
+        LogN('自动学习：前往上次的路径页', st.pathUrl);
+        setPanel('自动学习引导中…\n前往上次的成长计划路径页…');
+        location.href = st.pathUrl;
+      } else {
+        b.step = 'goto_study';
+        saveBootstrap(b);
+        LogN('自动学习：前往我的学习页');
+        setPanel('自动学习引导中…\n前往「我的学习」页找任务…');
+        location.href = STUDY_URL;
+      }
+      return;
+    }
+    // 跳转途中：等页面加载
+    saveBootstrap(b);
+  }
+
+  // 路径地址归一化（去掉查询串），用于 finishedPathUrls 比对
+  function pathKey(url) {
+    return String(url || '').replace(/\?.*$/, '').replace(/#$/, '');
+  }
+
+  // 本路径视频全部学完（没开自动考试，或已无可考项）→ 记录该路径已完成，
+  // 自动回「我的学习」找下一个任务继续学（剩余考试留待手动/自动考试处理）
+  function markPathFinishedAndNext(summary, examLeft) {
+    // 未开启「自动学习」：只是手动翻看到已学完的路径页，停留原地，绝不自动跳走
+    if (!isAutoLearnOn()) {
+      saveState({
+        phase: 'path_done',
+        activeCourseId: '',
+        activeTitle: '',
+        playerHeartbeatAt: 0,
+        lastAction: 'path_done_idle',
+        allowOpenNext: false,
+      });
+      setPanel(summary + '\n本路径视频已全部学完\n（未开启自动学习，停留在此页）\n点「自动学习」可自动去下一个任务');
+      return;
+    }
+    const bb = loadBootstrap();
+    if (bb && bb.active) return; // 已在引导流程中，避免重复触发
+    const st = loadState();
+    const key = pathKey(location.href);
+    const fin = Array.isArray(st.finishedPathUrls) ? st.finishedPathUrls.slice() : [];
+    if (key && fin.indexOf(key) < 0) fin.push(key);
+    saveState({
+      finishedPathUrls: fin,
+      phase: 'path_done',
+      activeCourseId: '',
+      activeTitle: '',
+      playerHeartbeatAt: 0,
+      lastAction: 'auto_next_task',
+      allowOpenNext: false,
+    });
+    saveBootstrap({
+      active: true,
+      step: 'goto_study',
+      startedAt: realNow(),
+      tries: 0,
+      triedTasks: (function () {
+        // 种子：引导里已有的排除名单 + 刚点进来刚学完的任务名（防重复点入）
+        const seed = Array.isArray(bb.triedTasks) ? bb.triedTasks.slice() : [];
+        const last = st.lastTaskEntered || '';
+        if (last && seed.indexOf(last) < 0) seed.push(last);
+        return seed;
+      })(),
+      lastTaskText: '',
+    });
+    LogA('本路径视频已全部学完，自动寻找下一个任务', { examLeft: examLeft || 0, finishedPaths: fin.length });
+    setPanel(
+      summary +
+        '\n本路径视频已全部学完' +
+        (examLeft ? '\n剩余考试 ' + examLeft + ' 项：未开自动考试，留待手动' : '') +
+        '\n>>> 1.5s后自动前往下一个任务…'
+    );
+    setTimeout(function () {
+      location.href = STUDY_URL;
+    }, 1500);
   }
 
   function isVisible(el) {
@@ -374,7 +1033,7 @@
   function hasLivePlayerLock(st) {
     if (!CFG.oneCourseAtATime || !st) return false;
     if (st.phase !== 'playing') return false;
-    const now = Date.now();
+    const now = realNow();
     const hb = st.playerHeartbeatAt || 0;
     const opened = st.activeOpenedAt || 0;
     const gone = st.playerUnloadAt || 0;
@@ -428,56 +1087,101 @@
       '</span></div>' +
       '<div id="xue-auto-panel-body">初始化...</div>' +
       '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' +
-      '<button id="xue-auto-force-next" style="cursor:pointer;border:0;border-radius:4px;padding:4px 8px;background:#10b981;color:#fff">开下一门</button>' +
-      '<button id="xue-auto-exam" style="cursor:pointer;border:0;border-radius:4px;padding:4px 8px;background:#f59e0b;color:#fff">自动考试</button>' +
-      '<button id="xue-auto-copy-log" style="cursor:pointer;border:0;border-radius:4px;padding:4px 8px;background:#3b82f6;color:#fff">复制日志</button>' +
-      '<button id="xue-auto-reset" style="cursor:pointer;border:0;border-radius:4px;padding:4px 8px;background:#6b7280;color:#fff">重置状态</button>' +
+      '<button id="xue-auto-start" style="cursor:pointer;border:0;border-radius:4px;padding:4px 8px;background:#374151;color:#fff">自动学习</button>' +
+      '<button id="xue-auto-exam" style="cursor:pointer;border:0;border-radius:4px;padding:4px 8px;background:#374151;color:#fff">自动考试</button>' +
+      '<button id="xue-auto-copy-log" style="cursor:pointer;border:0;border-radius:4px;padding:4px 8px;background:#374151;color:#fff">复制日志</button>' +
+      '<button id="xue-auto-reset" style="cursor:pointer;border:0;border-radius:4px;padding:4px 8px;background:#374151;color:#fff">重置状态</button>' +
+      '</div>' +
+      '<div style="margin-top:6px;display:flex;gap:4px;align-items:center;flex-wrap:wrap">' +
+      '<span style="opacity:.8">倍速</span>' +
+      '<button class="xue-speed-btn" data-rate="0" style="cursor:pointer;border:0;border-radius:4px;padding:3px 8px;color:#fff;background:#374151">关</button>' +
+      '<button class="xue-speed-btn" data-rate="2" style="cursor:pointer;border:0;border-radius:4px;padding:3px 8px;color:#fff;background:#374151">2x</button>' +
+      '<button class="xue-speed-btn" data-rate="4" style="cursor:pointer;border:0;border-radius:4px;padding:3px 8px;color:#fff;background:#374151">4x</button>' +
+      '<button class="xue-speed-btn" data-rate="8" style="cursor:pointer;border:0;border-radius:4px;padding:3px 8px;color:#fff;background:#374151">8x</button>' +
+      '<button class="xue-speed-btn" data-rate="16" style="cursor:pointer;border:0;border-radius:4px;padding:3px 8px;color:#fff;background:#374151">16x</button>' +
       '</div>';
     document.body.appendChild(box);
-    qs('#xue-auto-force-next', box).onclick = () => {
-      LogA('面板点击：开下一门');
-      saveState({
-        phase: 'path_running',
-        activeCourseId: '',
-        activeTitle: '',
-        playerHeartbeatAt: 0,
-        lastAction: 'manual_next',
-        allowOpenNext: true,
-        forceOpenOnce: true,
-      });
-      setPanel('手动：允许开下一门（仅一次）\n路径页会自动点第一门未学完课');
-      if (pageType() === 'path') setTimeout(function () { pathLoop(true); }, 300);
+    qs('#xue-auto-start', box).onclick = () => {
+      // 真开关：点一下开启（绿）并立即开始带路；再点一下停止（黑）
+      const turnOn = !loadState().autoLearnOn;
+      claimPathWorker();
+      if (turnOn) {
+        LogA('面板点击：开启自动学习（全局）');
+        saveState({ autoLearnOn: true, lastAction: 'manual_learn_on' });
+        setPanel('自动学习：已开启（全局记忆）\n正在带路/接管学习中...');
+        startBootstrap();
+      } else {
+        LogA('面板点击：停止自动学习（全局）');
+        saveBootstrap(null);
+        saveState({ autoLearnOn: false, lastAction: 'manual_learn_off', forceOpenOnce: false });
+        setPanel('自动学习：已停止\n当前视频会播完，但不再自动开新课/换任务\n再点一次可重新开始');
+      }
     };
     qs('#xue-auto-exam', box).onclick = () => {
-      LogA('面板点击：自动考试');
-      CFG.autoExam = true;
-      CFG.autoOpenExamFromPath = true;
-      // 清掉残留冷却/锁，避免卡死在「操作冷却中」
-      saveState({
-        lastAction: 'manual_exam',
-        allowOpenExam: true,
-        forceExamOnce: true,
-        examPhase: '',
-        phase: 'path_running',
-        examOpenedAt: 0,
-        lastExamOpenAt: 0,
-        lastExamHistoryAt: 0,
-        lastExamWindowAt: 0,
-      });
-      setPanel('手动：开启自动考试\n已清除冷却锁\n将点「待考试/开始考试/重新考试」');
+      // 全局持久化开关：考试流程跨多个标签（路径→考试→结果），必须所有标签读到同一个值
+      const turnOn = !loadState().autoExamOn;
+      claimPathWorker();
+      if (turnOn) {
+        LogA('面板点击：开启自动考试（全局）');
+        CFG.autoExam = true;
+        CFG.autoOpenExamFromPath = true;
+        // 清掉残留冷却/锁，避免卡死在「操作冷却中」
+        saveState({
+          autoExamOn: true,
+          lastAction: 'manual_exam_on',
+          allowOpenExam: true,
+          forceExamOnce: true,
+          examPhase: '',
+          phase: 'path_running',
+          examOpenedAt: 0,
+          lastExamOpenAt: 0,
+          lastExamHistoryAt: 0,
+          lastExamWindowAt: 0,
+        });
+        setPanel('自动考试：已开启（全局记忆）\n已清除冷却锁并接管操作权\n将点「待考试/开始考试/重新考试」\n再点一次可关闭');
+      } else {
+        LogA('面板点击：关闭自动考试（全局）');
+        CFG.autoExam = false;
+        CFG.autoOpenExamFromPath = false;
+        saveState({ autoExamOn: false, lastAction: 'manual_exam_off', forceExamOnce: false });
+        setPanel('自动考试：已关闭（全局）\n考试/结果标签将停止自动操作');
+      }
       if (pageType() === 'path') setTimeout(function () { pathLoop(true); }, 300);
       if (pageType() === 'exam') setTimeout(function () { examLoop(); }, 300);
       if (pageType() === 'exam_result') setTimeout(function () { examResultLoop(); }, 300);
     };
-    qs('#xue-auto-copy-log', box).onclick = () => {
+    const bCopy = qs('#xue-auto-copy-log', box);
+    bCopy.onclick = () => {
+      flashButton(bCopy, 900);
       LogA('面板点击：复制日志');
       copyLogs();
     };
-    qs('#xue-auto-reset', box).onclick = () => {
+    const bReset = qs('#xue-auto-reset', box);
+    bReset.onclick = () => {
+      flashButton(bReset, 900);
       LogA('面板点击：重置状态');
       localStorage.removeItem(STORE_KEY);
-      setPanel('状态已重置，请刷新页面\n日志仍保留，可点「复制日志」\n答案库未清空');
+      localStorage.removeItem(BOOT_KEY);
+      setPanel('状态已重置，请刷新页面\n自动考试/自动学习开关恢复为关\n已完成任务清单已清空\n倍速设置保留\n日志仍保留，可点「复制日志」\n答案库未清空');
     };
+    // 倍速行：关 / 2x / 4x / 8x / 16x（全局记忆，所有标签即时生效）
+    qsa('.xue-speed-btn', box).forEach((b) => {
+      b.onclick = () => {
+        const r = Number(b.getAttribute('data-rate')) || 0;
+        const c = loadSpeedCfg();
+        c.on = r > 0;
+        if (r > 0) c.rate = r;
+        saveSpeedCfg(c);
+        LogA('面板设置倍速', c);
+        applySpeedNow();
+        setPanel(
+          '倍速：' + (c.on ? c.rate + 'x（立即生效，全局记忆）' : '已关闭（1x自然播放）') +
+            (c.on ? '\n片尾最后8秒自动降为1x自然播完' : '')
+        );
+      };
+    });
+    refreshSpeedRowUI();
+    refreshToggleButtons();
     return box;
   }
   function setPanel(msg) {
@@ -485,6 +1189,7 @@
       ensurePanel();
       const body = qs('#xue-auto-panel-body');
       if (body) body.textContent = msg;
+      refreshToggleButtons();
     } catch (e) {}
   }
 
@@ -519,6 +1224,7 @@
             ok: true,
             status: 200,
             json: () => Promise.resolve({ code: 200 }),
+            text: () => Promise.resolve(''),
           });
         }
         return originalFetch.apply(this, arguments);
@@ -565,14 +1271,20 @@
 
     // ========== 核心4：自动关闭课程评价弹窗 ==========
     (function autoCloseEvaluation() {
+      // 节流+可见性判断：关闭动作至少间隔3s；弹窗关闭后元素常留在DOM里(隐藏)，
+      // 不可见的不点（旧版每1.5s重复点一次隐藏弹窗的关闭按钮）
+      let lastEvalCloseAt = 0;
       const observer = new MutationObserver(() => {
         const dialogs = document.querySelectorAll('div[role="dialog"]');
         dialogs.forEach((dialog) => {
+          if (!isVisible(dialog) && dialog.offsetParent === null) return;
           const ariaLabel = dialog.getAttribute('aria-label') || '';
           const titleEl = dialog.querySelector('.el-dialog__title');
           const titleText = titleEl ? titleEl.textContent : '';
 
           if (ariaLabel.includes('课程怎么样') || (titleText && titleText.includes('课程怎么样'))) {
+            if (realNow() - lastEvalCloseAt < 3000) return;
+            lastEvalCloseAt = realNow();
             const closeBtn = dialog.querySelector('.el-dialog__headerbtn, .el-icon-close');
             if (closeBtn) {
               closeBtn.click();
@@ -679,7 +1391,7 @@
       // 考试/结果页：短时间防重复；结果与正式考试用不同窗口名，避免 SPA 串台
       if (isExamUrl) {
         const key = urlStr.replace(/#.*$/, '') + '#' + (urlStr.match(/exam\/(?:train|result)[^?]*/)||[''])[0];
-        const now = Date.now();
+        const now = realNow();
         if (recentExamOpens[key] && now - recentExamOpens[key] < 30000) {
           LogW('拦截重复考试窗口', { url: urlStr.slice(0, 120), ago: now - recentExamOpens[key] });
           return null;
@@ -698,7 +1410,7 @@
         }
       }
       if (cid) {
-        const now = Date.now();
+        const now = realNow();
         // 刚完成的课，网站残留逻辑又要重开它：拦截，否则会把 course_done 覆盖回 playing，卡住不开下一门
         if (st.phase === 'course_done' && cid === st.lastFinishedCourseId) {
           LogW('拦截重开刚完成的课程', { cid: cid });
@@ -753,20 +1465,35 @@
       if (rawPush) {
         history.pushState = function () {
           LogN('history.pushState', { args0: arguments[2] || arguments[0] });
-          return rawPush.apply(history, arguments);
+          const prevT = pageType();
+          const r = rawPush.apply(history, arguments);
+          setTimeout(function () {
+            maybeReloadOnTypeChange(prevT);
+          }, 200);
+          return r;
         };
       }
       if (rawReplace) {
         history.replaceState = function () {
           LogN('history.replaceState', { args0: arguments[2] || arguments[0] });
-          return rawReplace.apply(history, arguments);
+          const prevT = pageType();
+          const r = rawReplace.apply(history, arguments);
+          setTimeout(function () {
+            maybeReloadOnTypeChange(prevT);
+          }, 200);
+          return r;
         };
       }
       window.addEventListener('hashchange', function () {
         LogN('hashchange', { href: location.href });
+        // 倍速引擎跟随页面类型启停：离开播放页立即还原钩子，进入播放页补挂
+        if (speedInstalled && !isPlayerUrl()) restoreSpeedHooks();
+        else if (!speedInstalled && isPlayerUrl() && loadSpeedCfg().on) installSpeedHooks();
+        maybeReloadOnTypeChange(bootPageType);
       });
       window.addEventListener('popstate', function () {
         LogN('popstate', { href: location.href });
+        maybeReloadOnTypeChange(bootPageType);
       });
       Log('导航监控已安装(beforeunload/history/hash)');
     } catch (e) {
@@ -884,9 +1611,15 @@
   }
 
   function pathTryExam(list, summary, forceOpen) {
-    if (!CFG.autoExam) return false;
+    if (!isAutoExamOn()) return false;
     let st = loadState();
-    const examTodos = list.filter((x) => x.needExam);
+    // 已通过的考试不再自动重考（路径页DOM状态不刷新时防止无限重考）
+    const passedList = Array.isArray(st.passedExams) ? st.passedExams : [];
+    const examTodos = list.filter(
+      (x) =>
+        x.needExam &&
+        !passedList.some((p) => (p.id && p.id === x.examId) || (p.title && p.title === normalizeQTitle(x.title)))
+    );
     if (!examTodos.length) {
       if (!list.filter((x) => isPathTodo(x.status)).length) {
         saveState({ phase: 'path_all_done', lastAction: 'path_all_done_no_exam' });
@@ -895,7 +1628,7 @@
       return false;
     }
 
-    const now = Date.now();
+    const now = realNow();
     // 清洗异常时间戳（日志里出现过“未来时间”导致永久冷却）
     const fixedOpen = saneTs(st.lastExamOpenAt, now);
     const fixedHist = saneTs(st.lastExamHistoryAt, now);
@@ -962,7 +1695,7 @@
       });
     }
 
-    const canExamAuto = !!(CFG.autoOpenExamFromPath || force || st.allowOpenExam);
+    const canExamAuto = !!(CFG.autoOpenExamFromPath || force || st.allowOpenExam || st.autoExamOn);
     if (!canExamAuto) {
       setPanel(
         summary +
@@ -1073,21 +1806,26 @@
     installNavWatch();
 
     const st0 = loadState();
-    saveState({
-      pathUrl: location.href,
-      phase:
-        st0.phase === 'playing'
-          ? 'playing'
-          : st0.phase === 'course_done'
-            ? 'course_done'
-            : st0.phase === 'exam_running' || st0.phase === 'exam_learning'
-              ? st0.phase
-              : 'path_running',
-    });
+    // 多标签防打架：全站同一时刻只允许一个「操作标签」执行点击（播放页/考试页回到
+    // 路径后会产生多个路径标签），其余标签仅监控显示
+    const isWorker = amPathWorker(st0);
+    if (isWorker) {
+      saveState({
+        pathUrl: location.href,
+        phase:
+          st0.phase === 'playing'
+            ? 'playing'
+            : st0.phase === 'course_done'
+              ? 'course_done'
+              : st0.phase === 'exam_running' || st0.phase === 'exam_learning'
+                ? st0.phase
+                : 'path_running',
+      });
+    }
 
-    // 未报名先点「我要学习」
-    if (Date.now() - lastEnrollClickAt > 2500 && clickEnrollIfNeeded()) {
-      lastEnrollClickAt = Date.now();
+    // 未报名先点「我要学习」（仅操作标签）
+    if (isWorker && realNow() - lastEnrollClickAt > 2500 && clickEnrollIfNeeded()) {
+      lastEnrollClickAt = realNow();
       LogA('路径页点击我要学习');
       return;
     }
@@ -1102,7 +1840,11 @@
     // 视频课 todo：不是待考试/重新学习/开始考试/重新考试
     const videoList = list.filter((x) => !x.isExam && !/开始考试|重新考试|待考试/.test(x.status));
     const done = videoList.filter((x) => isPathDone(x.status));
-    const todo = videoList.filter((x) => isPathTodo(x.status));
+    // 路径页DOM状态不刷新时，用本地已完成清单过滤，防止反复重开刚学完的课
+    const finishedSet = new Set(Array.isArray(st0.finishedCourseIds) ? st0.finishedCourseIds : []);
+    const todo = videoList.filter(
+      (x) => isPathTodo(x.status) && !finishedSet.has(x.courseId) && x.title !== (st0.lastFinishedTitle || '')
+    );
     const examTodos = list.filter((x) => x.needExam);
     const summary =
       '路径视频课 共' +
@@ -1125,6 +1867,15 @@
       autoOpenFromPath: CFG.autoOpenFromPath,
       autoExam: CFG.autoExam,
     });
+    if (!isWorker) {
+      const lease = loadState().pathWorker || {};
+      const stw = loadState();
+      let extra = '';
+      if (hasLivePlayerLock(stw)) extra = '\n播放中：' + (stw.activeTitle || stw.activeCourseId || '');
+      setPanel(summary + extra + '\n操作标签：#' + (lease.id || '?') + '\n本标签只监控，不重复点击');
+      return;
+    }
+
     const st = loadState();
 
     // 刚完成一门：只清锁，不强制 reload
@@ -1144,11 +1895,11 @@
         setTimeout(() => location.reload(), 1500);
         return;
       }
-      setPanel(summary + '\n刚完成一门\n' + (CFG.autoOpenFromPath ? '将打开下一门' : '请点面板「开下一门」'));
+      setPanel(summary + '\n刚完成一门\n' + (CFG.autoOpenFromPath ? '将打开下一门' : '请点面板「自动学习」'));
     }
 
     if (hasLivePlayerLock(st)) {
-      const ago = st.playerHeartbeatAt ? Math.round((Date.now() - st.playerHeartbeatAt) / 1000) : -1;
+      const ago = st.playerHeartbeatAt ? Math.round((realNow() - st.playerHeartbeatAt) / 1000) : -1;
       setPanel(summary + '\n播放中：' + (st.activeTitle || st.activeCourseId) + '\n心跳 ' + ago + 's前 (只开1门)\n不会自动关标签');
       return;
     }
@@ -1166,28 +1917,21 @@
       });
     }
 
-    // 视频都学完 → 自动考试
+    // 视频都学完 → 自动考试；没开自动考试（或已无可考项）→ 自动找下一个任务继续学
     if (!todo.length) {
       if (pathTryExam(list, summary, forceOpen)) return;
-      saveState({
-        phase: 'path_done',
-        activeCourseId: '',
-        activeTitle: '',
-        playerHeartbeatAt: 0,
-        lastAction: 'path_all_done',
-        allowOpenNext: false,
-      });
-      setPanel(summary + '\n本路径视频课已全部学完\n待考试也已处理完');
+      markPathFinishedAndNext(summary, examTodos.length);
       return;
     }
 
-    // 默认不自动开课：除非 CFG.autoOpenFromPath=true，或面板点了「开下一门」(forceOpen/forceOpenOnce)
+    // 默认不自动开课：除非 CFG.autoOpenFromPath=true，或面板点了「自动学习」(forceOpen/forceOpenOnce)
     const st2 = loadState();
-    const canAuto = !!(CFG.autoOpenFromPath || forceOpen || st2.forceOpenOnce);
+    // 总开关：未开启「自动学习」时绝不自动开课（纯手动浏览）
+    const canAuto = !!(CFG.autoOpenFromPath || forceOpen || st2.forceOpenOnce) && isAutoLearnOn();
     if (!canAuto) {
       setPanel(
         summary +
-          '\n自动开课：关闭（防闪退/重定向）\n请手动点「开始/继续学习」\n或点面板「开下一门」\n考试可点「自动考试」'
+          '\n自动开课：关闭（防闪退/重定向）\n请手动点「开始/继续学习」\n或点面板「自动学习」\n考试可点「自动考试」'
       );
       return;
     }
@@ -1200,20 +1944,20 @@
       }
     }
 
-    if (Date.now() - lastPathOpenAt < CFG.pathOpenCooldownMs) {
+    if (realNow() - lastPathOpenAt < CFG.pathOpenCooldownMs) {
       setPanel(summary + '\n即将打开：' + todo[0].title + '\n(防抖中，防连环开课...)');
-      Log('路径开课防抖中', { leftMs: CFG.pathOpenCooldownMs - (Date.now() - lastPathOpenAt) });
+      Log('路径开课防抖中', { leftMs: CFG.pathOpenCooldownMs - (realNow() - lastPathOpenAt) });
       return;
     }
 
     const next = todo[0];
-    lastPathOpenAt = Date.now();
+    lastPathOpenAt = realNow();
     saveState({
       pathUrl: location.href,
       activeCourseId: next.courseId || '',
       activeTitle: next.title,
-      activeOpenedAt: Date.now(),
-      playerHeartbeatAt: Date.now(),
+      activeOpenedAt: realNow(),
+      playerHeartbeatAt: realNow(),
       phase: 'playing',
       lastAction: 'open_course',
       allowOpenNext: false,
@@ -1227,12 +1971,37 @@
   // ---------- 播放页：章节/视频完成判定（v5.4 之外的唯一附加） ----------
   let lastSrc = '';
   let lastTime = 0;
-  let lastAdvanceAt = Date.now();
+  let lastAdvanceAt = realNow();
   let finishTriggered = false;
   let sectionClickAt = 0;
-  let lastSectionClickKey = '';
-  let sameSectionClickCount = 0;
-  let replaySeekAt = 0;
+  let activePlayerCid = '';
+  let playerSinceAt = realNow();
+  let lastHbWriteAt = 0;
+  // 播放页「学习」按钮节流（自定义/公开课程需要先点学习才开始登记学习记录）
+  let lastEnrollBtnAt = 0;
+  // 片尾降速：视频最后几秒按 1 倍速自然播完（内置倍速引擎 speedTailOverride 联动），
+  // 让平台自己的上报逻辑按真人节奏登记完成 —— 不伪造任何完成请求
+  let tailMode = false;
+  let tailReplays = 0;
+  // 视频播完后：等平台把目录状态确认成「已完成」再切下一节（根治来回跳）
+  let waitSectionEl = null;
+  let waitSectionKey = '';
+  let waitSince = 0;
+  // 重播多次平台仍不确认完成的项：标记放弃、不再回头点（防止死循环）
+  let gaveUpKeys = {};
+
+  function resetPlayerState(cid, why) {
+    activePlayerCid = cid;
+    playerSinceAt = realNow();
+    finishTriggered = false;
+    lastSrc = '';
+    lastTime = 0;
+    lastAdvanceAt = realNow();
+    sectionClickAt = 0;
+    gaveUpKeys = {};
+    resetSectionState(why ? 'resetPlayerState:' + why : '');
+    LogA('初始化播放页（新课程）', { cid: cid, why: why || '' });
+  }
 
   function getVideo() {
     return document.querySelector('video');
@@ -1302,95 +2071,74 @@
     return false;
   }
 
-  // 连续点同一目录项计数：点了也没反应说明网站从「上次学习」尾部续播，视频一进来就是播完状态
-  function trackSectionClick(key) {
-    if (key === lastSectionClickKey) sameSectionClickCount += 1;
-    else {
-      lastSectionClickKey = key;
-      sameSectionClickCount = 1;
-    }
-    return sameSectionClickCount;
+  function sectionKey(el) {
+    return text(el).slice(0, 60);
   }
 
-  // 反复点击无效时的自愈：把当前视频拉回片头重播，让服务器真正累计观看时长，状态才会变「已完成」
-  function replayFromStart(video, key) {
-    if (!video) return false;
-    if (Date.now() - replaySeekAt < 15000) return true; // 刚重播过，等它播，不再狂点
-    replaySeekAt = Date.now();
-    sectionClickAt = Date.now();
-    lastAdvanceAt = Date.now();
+  // 当前正在播放的目录项：优先 active 高亮，其次「学习中/上次学习」标记
+  function findCurrentSection(items) {
+    for (let i = 0; i < items.length; i++) {
+      if (/active/.test(items[i].className || '')) return { el: items[i], idx: i };
+    }
+    for (let i = 0; i < items.length; i++) {
+      const t = text(items[i]);
+      if (t.includes('学习中') || t.includes('上次学习')) return { el: items[i], idx: i };
+    }
+    return null;
+  }
+
+  function resetSectionState(why) {
+    tailMode = false;
+    tailReplays = 0;
+    waitSectionEl = null;
+    waitSectionKey = '';
+    waitSince = 0;
+    speedTailOverride = 0;
+    if (why) Log('重置小视频状态', why);
+  }
+
+  // 点击目录项切到某一小视频（3s 节流，点击后清空等待/片尾状态）
+  function clickSection(el, reason) {
+    if (!el) return false;
+    if (realNow() - sectionClickAt < 3000) return false;
+    const clickable =
+      el.querySelector('.category-name, .course-list__item__right, a, button, .title, .name') || el;
+    const key = sectionKey(el);
+    Log('切换小视频', { reason: reason, key: key.slice(0, 50) });
+    sectionClickAt = realNow();
+    lastAdvanceAt = realNow();
     lastTime = 0;
-    try {
-      video.currentTime = 0;
-      video.muted = true;
-      video.play().catch(() => {});
-    } catch (e) {}
-    Log('同一小视频反复点击无效，改为从头重播', key);
-    setPanel('该小视频停在片尾、状态未变「已完成」\n>>> 已从头重播\n' + key.slice(0, 50) + '\n播完后状态刷新才换下一门课');
+    lastSrc = '';
+    resetSectionState('clickSection:' + reason);
+    safeClick(clickable, reason);
+    setPanel('>>> ' + reason + '\n' + key.slice(0, 50) + '\n未全部「已完成」前不换下一门课');
     return true;
   }
 
-  function clickNextSectionIfNeeded(video) {
-    if (!video || !isVideoFinished(video)) return false;
-    if (Date.now() - sectionClickAt < 3000) return false;
-
-    const items = sectionItems();
-    if (!items.length) return false;
-
-    // 找当前「学习中/上次学习/active」项，再找其后第一个非「已完成」小视频
-    let currentIdx = -1;
-    for (let i = 0; i < items.length; i++) {
-      const t = text(items[i]);
-      const active = /active/.test(items[i].className || '');
-      if (active || t.includes('学习中') || t.includes('上次学习') || t.includes('未开始')) {
-        // 优先 active；否则第一个学习中/上次学习
-        if (active || currentIdx < 0) currentIdx = i;
-        if (active) break;
-      }
-    }
-
-    const start = currentIdx >= 0 ? currentIdx + 1 : 0;
-    for (let i = start; i < items.length; i++) {
+  // 找下一个未完成且未放弃的目录项：先从 fromIdx 往后，再从头补找
+  function findNextUnconfirmed(items, fromIdx) {
+    for (let i = fromIdx; i < items.length; i++) {
       const el = items[i];
+      if (gaveUpKeys[sectionKey(el)]) continue;
       if (isSectionComplete(el)) continue;
-      const t = text(el);
-      if (trackSectionClick(t.slice(0, 60)) >= 3 && replayFromStart(video, t.slice(0, 60))) return true;
-      const clickable =
-        el.querySelector('.category-name, .course-list__item__right, a, button, .title, .name') || el;
-      Log('切下一小视频', t.slice(0, 60));
-      sectionClickAt = Date.now();
-      lastAdvanceAt = Date.now();
-      lastTime = 0;
-      lastSrc = '';
-      safeClick(clickable, '下一小视频');
-      setPanel('当前小视频播完\n>>> 切换下一小视频\n' + t.slice(0, 50) + '\n未全部「已完成」前不换下一门课');
-      return true;
+      return el;
     }
-    // 若当前后面没有，再从头找第一个未完成
-    for (let i = 0; i < items.length; i++) {
+    for (let i = 0; i < Math.min(fromIdx, items.length); i++) {
       const el = items[i];
+      if (gaveUpKeys[sectionKey(el)]) continue;
       if (isSectionComplete(el)) continue;
-      const t = text(el);
-      if (trackSectionClick(t.slice(0, 60)) >= 3 && replayFromStart(video, t.slice(0, 60))) return true;
-      const clickable =
-        el.querySelector('.category-name, .course-list__item__right, a, button, .title, .name') || el;
-      Log('切未完成小视频', t.slice(0, 60));
-      sectionClickAt = Date.now();
-      lastAdvanceAt = Date.now();
-      lastTime = 0;
-      lastSrc = '';
-      safeClick(clickable, '未完成小视频');
-      setPanel('还有未完成小视频\n>>> ' + t.slice(0, 50) + '\n全部「已完成」后才换下一门课');
-      return true;
+      return el;
     }
-    return false;
+    return null;
   }
 
   // 严格规则：课内每一个小视频都必须是「已完成」才允许换下一门课
+  // 例外：多次片尾重播平台仍不确认的项（gaveUpKeys）视为已处理，避免卡死在同一门课
   function isCourseFullyDone() {
     const stats = sectionStats();
     if (stats.total <= 0) return false;
-    return stats.unfinished === 0 && stats.done === stats.total;
+    if (stats.unfinished === 0 && stats.done === stats.total) return true;
+    return stats.items.every((el) => isSectionComplete(el) || !!gaveUpKeys[sectionKey(el)]);
   }
 
   function finishCurrentCourse(reason) {
@@ -1399,6 +2147,18 @@
     if (!isCourseFullyDone()) {
       Log('拒绝提前完课（仍有未完成小视频）', sectionStats());
       finishTriggered = false;
+      return;
+    }
+    // 进页冷静期：刚进播放页（比如目录本来就是全部已完成的历史课）不立即完课，
+    // 防止误判秒回跳（旧版 minStayBeforeFinishMs 配置从未生效，这里补上）
+    const stayedMs = realNow() - playerSinceAt;
+    if (stayedMs < (CFG.minStayBeforeFinishMs || 20000)) {
+      Log('目录已全部完成，但冷静期未满暂不完课', { stayedMs: stayedMs });
+      setPanel(
+        '目录全部「已完成」\n冷静期 ' +
+          Math.ceil(((CFG.minStayBeforeFinishMs || 20000) - stayedMs) / 1000) +
+          's 后正式完课\n(防刚进页面就误判)'
+      );
       return;
     }
     finishTriggered = true;
@@ -1422,100 +2182,269 @@
       '本课全部小视频已「已完成」\n' +
         reason +
         '\n' +
-        CFG.doneWaitMs / 1000 +
-        's 后回路径页开下一门\n不会关闭标签'
+        (CFG.autoReturnToPath
+          ? CFG.doneWaitMs / 1000 + 's 后回路径页开下一门'
+          : '路径页将自动开下一门，本标签保持不动') +
+        '\n不会关闭标签'
     );
-    setTimeout(() => {
-      // 绝不 window.close
-      const pathUrl = loadState().pathUrl;
-      if (pathUrl) {
-        try {
-          location.href = pathUrl;
+    setTimeout(
+      () => {
+        // 默认不自动回跳路径（autoReturnToPath=false）：
+        // 路径操作标签检测到 course_done 后会在本标签（_xue_player）里打开下一门课
+        if (!CFG.autoReturnToPath) {
+          setPanel('本课已完成 ✓\n保持在本播放页等待下一门课');
+          // 兜底：若路径操作标签全关了（租约失活），本标签自动接替回路径，避免整体停摆
+          setTimeout(function () {
+            if (finishTriggered && pageType() === 'player') {
+              const st2 = loadState();
+              const lease = st2.pathWorker || {};
+              if (!lease.id || realNow() - (lease.at || 0) > 30000) {
+                LogW('路径操作标签已失活，播放页自动接替回路径');
+                if (st2.pathUrl) location.href = st2.pathUrl;
+              }
+            }
+          }, 60000);
           return;
-        } catch (e) {}
-      }
-      if (CFG.allowHistoryBack) {
-        try {
-          history.back();
-        } catch (e2) {}
-      } else {
-        setPanel('本课已完成，但没有路径页地址\n请手动回到成长计划路径页');
-      }
-    }, CFG.doneWaitMs);
+        }
+        // 绝不 window.close
+        const pathUrl = loadState().pathUrl;
+        if (pathUrl) {
+          try {
+            location.href = pathUrl;
+            return;
+          } catch (e) {}
+        }
+        if (CFG.allowHistoryBack) {
+          try {
+            history.back();
+          } catch (e2) {}
+        } else {
+          setPanel('本课已完成，但没有路径页地址\n请手动回到成长计划路径页');
+        }
+      },
+      CFG.doneWaitMs
+    );
   }
 
   function playerAdvanceTick() {
     if (!document.body) return;
-    // 完课后等待跳回路径页期间，心跳绝不能再把 course_done 覆盖回 playing
+    // 防僵尸：本标签 SPA 跳去了别的页面类型时，立即停止心跳/切课逻辑
+    if (pageType() !== 'player') return;
+    // 完课后等待期间，心跳绝不能把 course_done 覆盖回 playing
     if (finishTriggered) return;
     const video = getVideo();
     const stats = sectionStats();
     const cid = courseIdFromUrl(location.href);
 
-    // 心跳：告诉路径页「有课在播，别再开一门」
-    saveState({
-      phase: 'playing',
-      activeCourseId: cid || loadState().activeCourseId || '',
-      activeOpenedAt: loadState().activeOpenedAt || Date.now(),
-      activeTitle: loadState().activeTitle || document.title,
-      pathUrl: loadState().pathUrl || '',
-      playerHeartbeatAt: Date.now(),
-      playerUnloadAt: 0,
-      lastAction: 'player_heartbeat',
-      allowOpenNext: false,
-    });
+    // 心跳：告诉路径页「有课在播，别再开一门」（真实时钟；节流到 ≥1s 一次防 localStorage 狂写）
+    if (realNow() - lastHbWriteAt >= 1000) {
+      lastHbWriteAt = realNow();
+      saveState({
+        phase: 'playing',
+        activeCourseId: cid || loadState().activeCourseId || '',
+        activeOpenedAt: loadState().activeOpenedAt || realNow(),
+        activeTitle: loadState().activeTitle || document.title,
+        pathUrl: loadState().pathUrl || '',
+        playerHeartbeatAt: realNow(),
+        playerUnloadAt: 0,
+        lastAction: 'player_heartbeat',
+        allowOpenNext: false,
+      });
+    }
 
-    // 跟踪 src 变化（切章后）
+    // 学习按钮：自定义/公开课程的播放页要先点「学习/我要学习」才开始登记学习记录。
+    // 成长计划路径开出来的课没有这个按钮，不受影响（带节流，点过一次就不再点）
+    if (realNow() - lastEnrollBtnAt > 5000) {
+      const enrollBtn =
+        findEnrollButton() ||
+        qsa('button, a, [role="button"]').find((el) => text(el) === '学习' && isVisible(el)) ||
+        null;
+      if (enrollBtn) {
+        lastEnrollBtnAt = realNow();
+        LogA('检测到「学习」按钮，点击开始学习', { text: text(enrollBtn) });
+        setPanel('检测到「学习」按钮\n>>> 点击开始学习');
+        safeClick(enrollBtn, '播放页学习按钮');
+        return;
+      }
+    }
+
+    // 跟踪 src 变化（切小视频后）
     if (video) {
       const src = video.currentSrc || video.src || '';
       const t = video.currentTime || 0;
       if (src && src !== lastSrc) {
         lastSrc = src;
         lastTime = t;
-        lastAdvanceAt = Date.now();
+        lastAdvanceAt = realNow();
         finishTriggered = false;
-        sameSectionClickCount = 0; // 切到新视频了，重置反复点击计数
+        resetSectionState('切换新小视频(src变化)');
       } else if (!video.paused && Math.abs(t - lastTime) > 0.2) {
         lastTime = t;
-        lastAdvanceAt = Date.now();
-        sameSectionClickCount = 0; // 播放在正常推进，重置反复点击计数
+        lastAdvanceAt = realNow();
       }
     }
 
-    // 1) 当前小视频播完 → 只切课内下一视频，绝不因此离开课程
+    // 1) 片尾降速：媒体时间剩余 ≤8s 时降为 1 倍速自然播完（内置倍速引擎联动）
+    //    目的：高倍速下最后几秒一闪而过，平台上报来不及登记 → 服务器永远不给「已完成」。
+    //    按真人节奏播完片尾，平台自己的上报逻辑就会自然登记完成，不需要伪造任何请求。
+    if (video && !video.ended && !tailMode) {
+      const d = video.duration || 0;
+      if (d > 0 && d - (video.currentTime || 0) <= 8) {
+        tailMode = true;
+        speedTailOverride = 1;
+        hackVideoSpeed();
+        Log('进入片尾，自动降为1倍速自然播完', { leftSec: (d - video.currentTime).toFixed(1) });
+      }
+    }
+    if (tailMode && video && !video.ended && (video.duration || 0) - (video.currentTime || 0) > 15) {
+      // 片尾状态被重置（回看/换片），恢复加速
+      tailMode = false;
+      speedTailOverride = 0;
+      hackVideoSpeed();
+      Log('片尾状态解除，恢复倍速');
+    }
+
+    // 2) 当前小视频播完 → 等平台确认「已完成」再切下一节，绝不来回跳
     if (video && isVideoFinished(video)) {
-      const switched = clickNextSectionIfNeeded(video);
-      if (switched) {
+      const items = stats.items;
+      // 优先沿用正在等待确认的目录项，避免平台移动「上次学习」标记后跟错行
+      let curIdx = -1;
+      let curEl = null;
+      if (waitSectionKey) {
+        for (let i = 0; i < items.length; i++) {
+          if (sectionKey(items[i]) === waitSectionKey) {
+            curIdx = i;
+            curEl = items[i];
+            break;
+          }
+        }
+      }
+      if (!curEl) {
+        const cur = findCurrentSection(items);
+        if (cur) {
+          curEl = cur.el;
+          curIdx = cur.idx;
+        }
+      }
+
+      // 已放弃等待的项不再回头处理（点了也是原地转圈）
+      if (curEl && gaveUpKeys[sectionKey(curEl)]) {
+        const nx = findNextUnconfirmed(items, curIdx + 1);
+        if (nx) {
+          clickSection(nx, '继续下一项(跳过已放弃项)');
+          return;
+        }
+        if (isCourseFullyDone()) {
+          finishCurrentCourse('含未确认项，其余全部完成');
+          return;
+        }
+        setPanel('当前项已放弃等待且无下一项\n等待平台状态自愈...');
+        return;
+      }
+
+      if (curEl && isSectionComplete(curEl)) {
+        // 平台已确认完成 → 切下一节
+        waitSectionKey = '';
+        waitSectionEl = null;
+        waitSince = 0;
+        const nextEl = findNextUnconfirmed(items, curIdx + 1);
+        if (nextEl) {
+          clickSection(nextEl, '下一小视频');
+          return;
+        }
+        if (isCourseFullyDone()) {
+          finishCurrentCourse('全部小视频已确认完成 ' + stats.done + '/' + stats.total);
+          return;
+        }
+        setPanel('当前小视频已确认完成\n但目录仍有未完成项，继续等待...\n完成 ' + stats.done + '/' + (stats.total || '?'));
+        return;
+      }
+
+      // 平台可能已把「上次学习」标记移到下一项（前一项已确认完成）：直接开播标记项
+      if (curEl && curIdx > 0 && !waitSince && video.ended && isSectionComplete(items[curIdx - 1])) {
+        clickSection(curEl, '平台标记的下一项');
+        return;
+      }
+
+      // 未确认：先等（90s）→ 片尾10秒1倍速重播（≤2次）→ 放弃该项继续
+      if (!waitSince) {
+        waitSince = realNow();
+        waitSectionKey = curEl ? sectionKey(curEl) : '';
+        waitSectionEl = curEl;
+        Log('视频播完，等待平台确认「已完成」', { key: waitSectionKey.slice(0, 40) });
+      }
+      const waitedMs = realNow() - waitSince;
+      if (waitedMs < 90000) {
         setPanel(
-          '当前小视频播完\n已切下一视频\n目录完成 ' +
+          '视频播完，等平台确认完成\n剩余 ' +
+            Math.ceil((90000 - waitedMs) / 1000) +
+            's\n' +
+            waitSectionKey.slice(0, 40) +
+            '\n完成 ' +
             stats.done +
             '/' +
             (stats.total || '?') +
-            '\n必须全部「已完成」才换下一门课'
+            '\n未确认前不切下一节（防来回跳）'
         );
         return;
       }
-      // 找不到下一节时：只有目录全部「已完成」才完课
+      if (tailReplays < 2) {
+        tailReplays += 1;
+        waitSince = realNow();
+        tailMode = true;
+        speedTailOverride = 1;
+        try {
+          video.currentTime = Math.max(0, (video.duration || 12) - 10);
+          video.muted = true;
+          video.play().catch(function () {});
+        } catch (e) {}
+        LogW('平台未确认完成，片尾10秒按1倍速重播', { attempt: tailReplays, key: waitSectionKey.slice(0, 40) });
+        setPanel('平台未确认完成\n>>> 片尾10秒按1倍速重播（第' + tailReplays + '次）\n' + waitSectionKey.slice(0, 40));
+        return;
+      }
+      // 重播两次平台仍不确认：标记放弃，继续下一节，绝不回头反复点
+      gaveUpKeys[waitSectionKey] = realNow();
+      LogE('多次重播仍未确认完成，跳过该项继续', { key: waitSectionKey.slice(0, 60) });
+      waitSectionKey = '';
+      waitSectionEl = null;
+      waitSince = 0;
+      const nextEl2 = findNextUnconfirmed(items, 0);
+      if (nextEl2) {
+        clickSection(nextEl2, '跳过未确认项继续');
+        return;
+      }
       if (isCourseFullyDone()) {
-        finishCurrentCourse('全部小视频已完成 ' + stats.done + '/' + stats.total);
-      } else {
-        setPanel(
-          '当前视频结束，但目录仍有未完成\n完成 ' +
-            stats.done +
-            '/' +
-            (stats.total || '?') +
-            ' 未完成' +
-            (stats.unfinished || 0) +
-            '\n等待状态变「已完成」或手动点下一节\n不会离开本课'
-        );
+        finishCurrentCourse('含未确认项，其余全部完成');
+        return;
       }
       return;
     }
 
-    // 2) 目录全部「已完成」→ 才回路径开下一课
+    // 3) 目录全部「已完成」→ 才算本课完成
     if (isCourseFullyDone()) {
       finishCurrentCourse('目录全部已完成 ' + stats.done + '/' + stats.total);
       return;
+    }
+
+    // 4) 卡死自愈（等待平台确认期间不触发，避免误杀正常等待）
+    if (!waitSince) {
+      const rn = realNow();
+      if (video && !isVideoFinished(video) && rn - lastAdvanceAt > 180000) {
+        if (rn - lastAdvanceAt > 240000) {
+          LogE('播放超过4分钟无任何进展，自动刷新播放页', {
+            t: video.currentTime,
+            src: (video.currentSrc || '').slice(0, 80),
+          });
+          location.reload();
+          return;
+        }
+        LogW('播放3分钟无进展（可能缓冲卡死）', { t: video.currentTime });
+      }
+      if (!video && rn - playerSinceAt > 120000) {
+        LogW('播放页超过2分钟没有视频元素，自动刷新');
+        location.reload();
+        return;
+      }
     }
 
     const playState = video
@@ -1539,14 +2468,17 @@
         (stats.unfinished || 0) +
         '\n' +
         playState +
+        (tailMode ? '\n片尾1倍速自然播完中…' : '') +
         '\n规则：全部已完成才换下一门课\n不会关标签/不会乱跳'
     );
   }
 
   // ---------- 学习列表页（可选，默认关闭自动点计划） ----------
   function studyHintLoop() {
+    // 「自动学习」引导进行中时不覆盖引导提示
+    if (loadBootstrap().active) return;
     setPanel(
-      '我的学习页\n请手动进入：专属成长计划 → 具体任务\n（例如：集团财务条线…）\n进入路径后脚本会自动开未学完课程'
+      '我的学习页\n可点面板「自动学习」一键带路\n或手动进入：专属成长计划 → 具体任务\n进入路径后脚本会自动开未学完课程'
     );
   }
 
@@ -1581,8 +2513,15 @@
     const labels = qsa('div.choice label, .choice label', item);
     labels.forEach((lab) => {
       const t = text(lab).trim();
-      const letter = t.match(/^([A-D])$/) ? t : /正确|错误/.test(t) ? t : '';
-      if (want.some((w) => w === letter || w === t)) {
+      // 兼容 "A" / "A.xxx" / "A、xxx" / "A xxx" / 「正确」「错误」等标签写法
+      // （旧版只认整标签恰为单个字母，"A.选项内容" 全部漏配 → 正式考试全部盲答）
+      const m = t.match(/^([A-Da-d])(?:[.、．\s]|$)/);
+      let letter = m ? m[1].toUpperCase() : '';
+      if (!letter) {
+        if (/正确|对|是/.test(t) && !/错误|否|错/.test(t)) letter = '正确';
+        else if (/错误|否|错/.test(t)) letter = '错误';
+      }
+      if (letter && want.some((w) => w === letter || w === t)) {
         const input = qs('input', lab);
         if (input && !input.checked) {
           try {
@@ -1673,6 +2612,11 @@
     if (examAnsweredAt) return true;
     const items = collectExamItems();
     if (!items.length) return false;
+    // 试卷懒加载：题目变多时更新总数，避免漏答后面才渲染的题
+    if (examAnswerProgress.total && items.length > examAnswerProgress.total) {
+      LogW('试卷题目增多（懒加载），更新总数', { old: examAnswerProgress.total, now: items.length });
+      examAnswerProgress.total = items.length;
+    }
 
     const st = loadState();
     const examId = examIdFromUrl() || st.examId || '';
@@ -1704,7 +2648,7 @@
     const i = examAnswerProgress.idx;
     if (i >= items.length) {
       examAnswering = false;
-      examAnsweredAt = Date.now();
+      examAnsweredAt = realNow();
       examSubmitStarted = false;
       const st0 = loadState();
       // 保留路径页写入的 examMode/examHasHistory；仅在完全未知时兜底
@@ -1713,7 +2657,7 @@
         phase: 'exam_running',
         examId: examAnswerProgress.examId || examId,
         examTitle: examAnswerProgress.examTitle || examTitle,
-        examOpenedAt: st0.examOpenedAt || Date.now(),
+        examOpenedAt: st0.examOpenedAt || realNow(),
         lastAction: keepMode === 'known' ? 'exam_answer_known' : 'exam_answer_blind',
         examMode: keepMode,
         examHasHistory: st0.examHasHistory,
@@ -1776,7 +2720,7 @@
 
   function handleExamModals() {
     // 弹窗操作节流：避免反复点确认/关闭
-    if (lastModalActionAt && Date.now() - lastModalActionAt < (CFG.examModalWaitMs || 2500)) {
+    if (lastModalActionAt && realNow() - lastModalActionAt < (CFG.examModalWaitMs || 2500)) {
       return lastModalKind || 'wait';
     }
     const confirmBtn = findVisibleModalButton(['确认', '确定']);
@@ -1786,7 +2730,7 @@
       .join(' ');
     if (confirmBtn && /交卷|提交|无法更改|是否确定/.test(modalText + text(confirmBtn.parentElement || document.body))) {
       LogA('考试确认交卷弹窗', modalText.slice(0, 80));
-      lastModalActionAt = Date.now();
+      lastModalActionAt = realNow();
       lastModalKind = 'confirm';
       // 稍等再点确认，别秒点
       setTimeout(function () {
@@ -1799,7 +2743,7 @@
       const closeBtn = findVisibleModalButton(['关闭']);
       const failed = /未通过|遗憾|不及格/.test(modalText);
       LogA('考试结果弹窗', modalText.slice(0, 100));
-      lastModalActionAt = Date.now();
+      lastModalActionAt = realNow();
       lastModalKind = 'result_close';
       saveState({
         lastAction: 'exam_result_modal',
@@ -1807,10 +2751,11 @@
         examPhase: failed ? 'failed' : 'passed',
         phase: failed ? 'exam_failed' : 'exam_passed',
         // 保持锁一会儿，避免路径页立刻又开
-        examOpenedAt: Date.now(),
+        examOpenedAt: realNow(),
         allowOpenExam: true,
-        lastExamOpenAt: Date.now(),
+        lastExamOpenAt: realNow(),
       });
+      if (!failed) recordExamPassed('result_modal');
       if (closeBtn) {
         setTimeout(function () {
           safeClick(closeBtn, '关闭结果');
@@ -1830,7 +2775,7 @@
     // 通用关闭
     const close2 = findVisibleModalButton(['关闭']);
     if (close2 && modalText) {
-      lastModalActionAt = Date.now();
+      lastModalActionAt = realNow();
       lastModalKind = 'close';
       setTimeout(function () {
         safeClick(close2, '关闭弹窗');
@@ -1858,7 +2803,7 @@
   }
 
   function examLoop() {
-    if (!document.body || !CFG.autoExam) return;
+    if (!document.body || !isAutoExamOn()) return;
     // SPA：已离开考试页则停
     if (pageType() !== 'exam') return;
     if (examPageMode && examPageMode !== 'exam') return;
@@ -1896,7 +2841,7 @@
     }
 
     const submitDelay = currentExamSubmitDelayMs();
-    if (!examSubmitStarted && Date.now() - examAnsweredAt >= submitDelay) {
+    if (!examSubmitStarted && realNow() - examAnsweredAt >= submitDelay) {
       if (submitVisible) {
         examSubmitStarted = true;
         submitExamPaper();
@@ -1905,7 +2850,7 @@
         setPanel('试卷已提交或按钮不可见\n等待结果弹窗...');
       }
     } else if (!examSubmitStarted) {
-      const left = Math.ceil((submitDelay - (Date.now() - examAnsweredAt)) / 1000);
+      const left = Math.ceil((submitDelay - (realNow() - examAnsweredAt)) / 1000);
       const stMode = loadState().examMode === 'blind' ? '首次盲答' : '正式考试';
       setPanel('已答完，倒计时交卷\n模式：' + stMode + '\n剩余 ' + left + 's / ' + Math.round(submitDelay / 1000) + 's');
     } else {
@@ -1925,7 +2870,7 @@
     bank.questions = bank.questions || {};
     bank.examId = examId || bank.examId || '';
     bank.examTitle = examTitle || bank.examTitle || '';
-    bank.updatedAt = Date.now();
+    bank.updatedAt = realNow();
     let count = 0;
 
     items.forEach((item) => {
@@ -1995,7 +2940,7 @@
   }
 
   function examResultLoop() {
-    if (!document.body || !CFG.autoExam) return;
+    if (!document.body || !isAutoExamOn()) return;
     // SPA：若已离开结果页，立刻停手（关键修复：不再把正式考试页踢回路径）
     if (pageType() !== 'exam_result') {
       clearExamResultReturnTimer();
@@ -2022,13 +2967,14 @@
       const ansMap = loadAnswers();
       if (eid && ansMap[eid] && ansMap[eid].ready) {
         examResultHandled = true;
+        if (detectResultPass()) recordExamPassed('result_page_cached');
         saveState({
           phase: 'exam_learned',
           examId: eid,
           allowOpenExam: true,
           lastAction: 'exam_already_learned',
           // 注意：不要刷新 lastExamOpenAt 成“刚开考”，否则路径页会误判冷却/锁
-          lastExamHistoryAt: Date.now(),
+          lastExamHistoryAt: realNow(),
           examOpenedAt: 0,
         });
         setPanel('本卷答案库已存在\n' + Math.round((CFG.examResultReturnMs || 8000) / 1000) + 's后回路径重考');
@@ -2049,6 +2995,7 @@
     }
     examResultHandled = true;
     LogA('已从结果页记忆答案', learned);
+    if (detectResultPass()) recordExamPassed('result_page');
     saveState({
       phase: 'exam_learned',
       examId: learned.examId || loadState().examId || '',
@@ -2058,7 +3005,7 @@
       examPhase: 'learned',
       // 记答案完成：解开 exam 锁，允许路径页正式开考；仅保留 history 冷却
       examOpenedAt: 0,
-      lastExamHistoryAt: Date.now(),
+      lastExamHistoryAt: realNow(),
       // 不写 lastExamOpenAt，避免挡住紧接着的正式开考
     });
     setPanel(
@@ -2082,6 +3029,7 @@
   // =========================
   function boot() {
     const type = pageType();
+    bootPageType = type;
     installNavWatch();
     LogA('自动看课助手 v' + VER + ' 启动', {
       type: type,
@@ -2099,8 +3047,14 @@
     });
     ensurePanel();
 
+    // 一键「自动学习」引导：每页启动时检查并继续，直到到达路径页（未激活时零开销）
+    try {
+      bootstrapTick();
+      setInterval(bootstrapTick, 2000);
+    } catch (e) {}
+
     if (type === 'study') {
-      setPanel('页面：我的学习\n请点「专属成长计划」并进入具体任务\n脚本不会替你乱点计划卡片\n可点「复制日志」');
+      setPanel('页面：我的学习\n可点面板「自动学习」一键开始\n或手动进入：专属成长计划 → 具体任务\n可点「复制日志」');
       setInterval(studyHintLoop, 8000);
       return;
     }
@@ -2112,7 +3066,12 @@
           '\n待考试/开始考试/重新考试=需考\n无时钟=首次盲答3s\n有时钟=看答案后正式考≥1分钟\n自动开课：' +
           (CFG.autoOpenFromPath ? '开' : '关') +
           ' 自动考试：' +
-          (CFG.autoExam ? '开' : '关')
+          (isAutoExamOn() ? '开(全局)' : '关') +
+          ' 倍速：' +
+          (function () {
+            const c = loadSpeedCfg();
+            return c.on ? c.rate + 'x' : '关';
+          })()
       );
       setTimeout(function () { pathLoop(false); }, 800);
       setTimeout(function () { pathLoop(false); }, 2000);
@@ -2122,6 +3081,34 @@
     }
 
     if (type === 'player') {
+      activePlayerCid = courseIdFromUrl(location.href) || 'unknown';
+      playerSinceAt = realNow();
+      // 同标签换课（路径页 window.open 复用 _xue_player 标签、URL 仅 hash 变化）时，
+      // 重置播放状态，避免上一门课的 finishTriggered/等待状态卡住新课
+      window.addEventListener('hashchange', function () {
+        if (pageType() !== 'player') return;
+        const cid = courseIdFromUrl(location.href);
+        if (cid && cid !== activePlayerCid) resetPlayerState(cid, 'hashchange换课');
+      });
+      // 0) 倍速引擎：document-start 已挂钩的保持；未挂钩（中途开启/SPA进入）的现在补挂。
+      //    旧独立「16倍速」脚本若还在运行会双重加速，必须删除。
+      if (loadSpeedCfg().on && !speedInstalled) installSpeedHooks();
+      if (window.__hook_timer_loaded) {
+        LogW('检测到旧「阳光学习平台16倍速」独立脚本仍在运行，会双重加速！请到 Tampermonkey 管理面板删除旧脚本');
+        setPanel('⚠ 检测到旧「16倍速」独立脚本\n请先删除它，否则会双重加速');
+      }
+      // 倍速保持：每秒按当前设置/片尾降速强制视频倍速（用原始定时器，不自我加速狂刷）；
+      // 新插入的 video 元素也立即应用
+      {
+        const schedSpeed =
+          speedInstalled && speedOrigSetInterval ? speedOrigSetInterval : window.setInterval.bind(window);
+        schedSpeed(hackVideoSpeed, 1000);
+        try {
+          new MutationObserver(function () {
+            hackVideoSpeed();
+          }).observe(document.body, { childList: true, subtree: true });
+        } catch (e) {}
+      }
       // 1) 严格加载你验证过的 v5.4
       installV54PlayerCore();
       // 2) 仅附加：播完判定与下一课编排（默认不自动回路径）
@@ -2132,12 +3119,15 @@
           const st = loadState();
           const cid = courseIdFromUrl(location.href);
           if (st.phase === 'playing' && cid && cid === st.activeCourseId) {
-            saveState({ playerUnloadAt: Date.now(), lastAction: 'player_unload' });
+            saveState({ playerUnloadAt: realNow(), lastAction: 'player_unload' });
           }
         } catch (e) {}
       });
+      const spdCfg = loadSpeedCfg();
       setPanel(
-        '播放页已加载 v5.4 原逻辑\n附加：播完切下一小视频\n全部「已完成」才算完课\n禁止自动回跳路径\n可点「复制日志」'
+        '播放页已加载 v5.4 原逻辑\n倍速：' +
+          (spdCfg.on ? spdCfg.rate + 'x（片尾自动降1x）' : '关') +
+          '\n播完等平台确认完成再切下一节\n全部「已完成」才算完课\n可点「复制日志」'
       );
       Log('播放页编排已启动', { autoReturnToPath: CFG.autoReturnToPath });
       return;
@@ -2241,6 +3231,12 @@
       });
     }
   }
+
+  // 倍速引擎要在页面自己的脚本调度计时器之前挂钩。本脚本整体在 document-start
+  // 同步执行，这里虽在文件末尾，仍早于页面脚本运行。
+  try {
+    if (isPlayerUrl() && loadSpeedCfg().on) installSpeedHooks();
+  } catch (e) {}
 
   startWhenReady();
 })();
